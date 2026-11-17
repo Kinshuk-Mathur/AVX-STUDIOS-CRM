@@ -33,7 +33,8 @@ test('AVX OS financial and security integration suite', async (t) => {
   let viewerToken: string;
   let viewerSession: string;
   let serviceId: string;
-  try {
+  t.after(closeDb);
+  {
     await t.test('secure single-owner initialization and authentication', async () => {
       const password = 'integration-' + randomUUID();
       const passwordHash = await hashPassword(password);
@@ -490,8 +491,6 @@ test('AVX OS financial and security integration suite', async (t) => {
       );
       assert.equal(response.status, 403);
     });
-  } finally {
-    await closeDb();
   }
 });
 

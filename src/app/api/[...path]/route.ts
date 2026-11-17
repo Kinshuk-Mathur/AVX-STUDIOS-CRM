@@ -1,3 +1,4 @@
+import { redeemOwnerRecovery } from '@/server/services/owner-recovery';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import {
@@ -87,6 +88,11 @@ async function handler(request: Request, { params }: { params: Promise<{ path: s
     const mutate = !['GET', 'HEAD'].includes(request.method);
     if (mutate) checkOrigin(request);
     if (section === 'auth') {
+      if (id === 'owner-setup' && request.method === 'POST') {
+        await throttle('owner-recovery:' + clientAddress(request), 8);
+        const result = await redeemOwnerRecovery(await body(request), clientAddress(request));
+        return json(result, 200, { 'Set-Cookie': sessionCookie('', true) });
+      }
       if (id === 'login' && request.method === 'POST') {
         await throttle('ip:' + clientAddress(request), 30);
         const v = loginSchema.parse(await body(request));

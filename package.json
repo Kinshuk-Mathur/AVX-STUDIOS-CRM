@@ -13,7 +13,9 @@
     "owner:create": "node --env-file-if-exists=.env --env-file-if-exists=.env.local --import tsx scripts/owner.ts",
     "check": "npm run lint && npm run typecheck && npm test && npm run build",
     "format": "prettier --write src scripts tests docs README.md *.json *.ts *.mjs",
-    "format:check": "prettier --check src scripts tests docs README.md *.json *.ts *.mjs"
+    "format:check": "prettier --check src scripts tests docs README.md *.json *.ts *.mjs",
+    "owner:setup": "node --env-file-if-exists=.env --env-file-if-exists=.env.local --import tsx scripts/owner-setup.ts",
+    "owner:reset": "node --env-file-if-exists=.env --env-file-if-exists=.env.local --import tsx scripts/owner-setup.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "0.5.16",

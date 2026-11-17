@@ -28,3 +28,7 @@ A refund date comparison failed in the first test pass because the local Postgre
 Automated tests use isolated in-memory PostgreSQL. HTTP smoke tests used a separate temporary PGlite directory and generated credentials. The temporary browser test data and credentials were removed. No real business records or permanent owner credentials were created.
 
 See README.md for implemented features and known limits, and docs/DEPLOYMENT.md for database roles, environment, initialization, deployment and backup instructions.
+
+## Owner recovery update
+
+Owner setup/recovery now uses a trusted CLI-generated, single-use 30-minute link and a browser credential form. The complete suite passes **28 tests**, including initial owner creation, token hashing, expired/reused/invalid links, competing redemptions, preserved owner ID and business records, session revocation, CSRF, and absence of a public link issuer. TypeScript, ESLint and production build also pass. A local database backup was taken before activating recovery; no new password has been selected for the user.

@@ -19,6 +19,21 @@ Open **http://localhost:3000/login**. The owner command prompts for a username, 
 
 For viewer access on another device, use a deployed HTTPS instance. The development server binds to loopback by default. A local single-process PostgreSQL engine, PGlite, persists records in `.data/avx`; do not run two processes against the same directory. Stop the web server before running database maintenance or the owner CLI. **PGlite is for local development; production requires PostgreSQL.**
 
+## Create or recover owner credentials in your browser
+
+Stop the local app first (Control+C in its terminal), then run:
+
+```sh
+npm run owner:setup
+npm run dev
+```
+
+Open the private link printed by the setup command. Choose your owner name, username and new password, confirm it, and click **Save owner credentials**. Then use **Owner sign in** at `/login`. The Viewer sign in page is for read-only guest accounts.
+
+The link expires after 30 minutes, works once, and is generated only from the trusted project terminal. Generating another link invalidates older links. It creates the single owner if needed or updates the existing owner's credentials while retaining the owner ID and business records. Completing recovery revokes all previous sessions. The database stores only the token hash; the URL fragment is removed from browser history when the form opens. Keep the link private. If you reload the form, reopen the original private link.
+
+`npm run owner:reset` is an alias for the same secure setup-link command. There is no public registration or public reset-link issuer. For managed PostgreSQL, run database migrations with the admin credential before using recovery.
+
 ## Implemented workflows
 
 - Owner login, scrypt-hashed passwords, hashed opaque session tokens, HttpOnly SameSite cookies, CSRF origin checks, persistent login throttling, owner password changes, access audits.

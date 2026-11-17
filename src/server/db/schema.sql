@@ -1,4 +1,5 @@
 CREATE TABLE IF NOT EXISTS schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS owner_recovery_tokens(token_hash text PRIMARY KEY, created_at timestamptz NOT NULL DEFAULT now(), expires_at timestamptz NOT NULL, consumed_at timestamptz);
 CREATE TABLE IF NOT EXISTS owners(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), singleton boolean NOT NULL UNIQUE DEFAULT true CHECK(singleton), username text NOT NULL UNIQUE, display_name text NOT NULL, password_hash text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS agency_settings(id boolean PRIMARY KEY DEFAULT true CHECK(id), data jsonb NOT NULL DEFAULT '{}', updated_at timestamptz NOT NULL DEFAULT now());
 INSERT INTO agency_settings(data) VALUES ('{"name":"AVX Studios","tagline":"Art • Visual • Experience","website":"https://avxstudios.netlify.app","currency":"INR","receiptPrefix":"AVX-RCP","invoicePrefix":"AVX-INV","quotePrefix":"AVX-QTE","footer":"Thank you for working with AVX Studios.","requestTimeoutMinutes":5,"sessionMinutes":60,"idleMinutes":15,"accent":"#ff002c","taxBps":0}') ON CONFLICT DO NOTHING;
@@ -77,4 +78,4 @@ EXECUTE format('CREATE POLICY business_read ON %I FOR SELECT USING (avx_owner() 
 END LOOP; END $$;
 DROP POLICY IF EXISTS business_read ON service_categories;
 CREATE POLICY business_read ON service_categories FOR SELECT USING (true);
-INSERT INTO schema_migrations(version) VALUES(1) ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations(version) VALUES(1),(2) ON CONFLICT DO NOTHING;

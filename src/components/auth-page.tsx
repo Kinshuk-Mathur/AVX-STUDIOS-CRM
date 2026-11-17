@@ -149,6 +149,14 @@ export function AuthPage({ viewer }: { viewer: boolean }) {
         ) : (
           <>
             <span className="eyebrow">PRIVATE STUDIO WORKSPACE</span>
+            <div className="login-mode">
+              <Link className={!viewer ? 'selected' : ''} href="/login">
+                Owner sign in
+              </Link>
+              <Link className={viewer ? 'selected' : ''} href="/viewer-login">
+                Viewer sign in
+              </Link>
+            </div>
             <h2>{viewer ? 'A window into the studio.' : 'Welcome back.'}</h2>
             <p>
               {viewer
@@ -198,10 +206,11 @@ export function AuthPage({ viewer }: { viewer: boolean }) {
             </div>
             {!viewer && (
               <details className="setup-help">
-                <summary>First time setting up?</summary>
+                <summary>Create or reset owner credentials</summary>
                 <p>
-                  From your project folder, run <code>npm run owner:create</code> to create your
-                  single owner account securely. Public registration is disabled.
+                  Stop the local app. Run <code>npm run owner:setup</code> in your project folder,
+                  then <code>npm run dev</code>. Open the private link to choose your owner username
+                  and password.
                 </p>
               </details>
             )}

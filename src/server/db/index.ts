@@ -28,7 +28,14 @@ async function connect(): Promise<Driver> {
   const version = await db.query<{ exists: boolean }>(
     "SELECT to_regclass('public.schema_migrations') IS NOT NULL AS exists",
   );
-  if (!version.rows[0].exists)
+  const currentVersion = version.rows[0].exists
+    ? (
+        await db.query<{ version: number }>(
+          'SELECT coalesce(max(version),0) AS version FROM schema_migrations',
+        )
+      ).rows[0].version
+    : 0;
+  if (currentVersion < 2)
     await db.exec(await readFile(path.resolve('src/server/db/schema.sql'), 'utf8'));
   return { kind: 'local', db };
 }

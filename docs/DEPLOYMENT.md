@@ -62,3 +62,7 @@ For local development, stop all app processes before copying the entire `.data/a
 ## Release verification
 
 Validate owner login and password rotation, viewer pending/approve/reject/revoke on two devices, section isolation, an invoice with partial and final payments, PDF download, refund reconciliation, actual email receipt delivery, backup restoration and multi-instance SSE reconciliation in the target environment. Local integration tests do not replace this deployment verification.
+
+## Owner recovery
+
+Apply schema migration 2 before deploying the recovery UI. Generate a one-use recovery link with `npm run owner:setup` from a trusted server terminal with the appropriate database connection and canonical HTTPS `APP_ORIGIN`. This operation does not reset credentials until the form is submitted. The link expires in 30 minutes. Recovery preserves business records and revokes existing owner/viewer sessions. Keep administrative terminal access and the printed link private. Stop a local PGlite web process before running this CLI, then restart it to use the form.

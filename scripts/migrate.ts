@@ -10,7 +10,7 @@ async function main() {
       await client.query('BEGIN');
       await client.query(await readFile('src/server/db/schema.sql', 'utf8'));
       await client.query('COMMIT');
-      console.log('PostgreSQL migration 1 applied.');
+      console.log('PostgreSQL migrations through version 2 applied.');
     } catch (e) {
       await client.query('ROLLBACK');
       throw e;

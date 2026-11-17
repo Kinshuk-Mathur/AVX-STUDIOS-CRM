@@ -5,7 +5,10 @@ import { transaction, one, closeDb } from '../src/server/db';
 async function main() {
   if (process.env.DATABASE_ADMIN_URL) process.env.DATABASE_URL = process.env.DATABASE_ADMIN_URL;
   const existing = await transaction((tx) => one(tx, 'SELECT id FROM owners LIMIT 1'));
-  if (existing) throw new Error('An owner already exists. Use Settings to change the password.');
+  if (existing)
+    throw new Error(
+      'Your owner account already exists. Sign in at /login. To reset credentials, stop the local app and run npm run owner:setup.',
+    );
   let muted = false;
   const output = new Writable({
     write(chunk, encoding, cb) {

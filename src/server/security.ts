@@ -79,18 +79,26 @@ export function clientAddress(request: Request) {
     ? request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown'
     : 'local';
 }
+type StoredSessionStatus = 'pending' | 'approved' | 'rejected' | 'revoked' | 'expired';
+export type SessionState =
+  | { status: 'approved'; principal: Principal }
+  | { status: Exclude<StoredSessionStatus, 'approved'> | 'signed-out'; principal?: undefined };
+
 interface SessionRow {
   id: string;
   owner_id: string | null;
   viewer_id: string | null;
-  status: string;
+  status: StoredSessionStatus;
   name: string;
   permissions: Section[];
   valid: boolean;
 }
-export async function sessionState(token: string | undefined, touch = false) {
+export async function sessionState(
+  token: string | undefined,
+  touch = false,
+): Promise<SessionState> {
   if (!token) return { status: 'signed-out' };
-  return transaction(async (tx) => {
+  return transaction<SessionState>(async (tx) => {
     const row = await one<SessionRow>(
       tx,
       `SELECT s.id,s.owner_id,s.viewer_id,s.status,coalesce(o.display_name,v.display_name) AS name,
@@ -103,7 +111,9 @@ export async function sessionState(token: string | undefined, touch = false) {
     if (!row.valid) {
       if (['pending', 'approved'].includes(row.status))
         await tx.query("UPDATE sessions SET status='expired' WHERE id=$1", [row.id]);
-      return { status: ['rejected', 'revoked'].includes(row.status) ? row.status : 'expired' };
+      return {
+        status: row.status === 'rejected' || row.status === 'revoked' ? row.status : 'expired',
+      };
     }
     if (row.status !== 'approved') return { status: row.status };
     if (touch) await tx.query('UPDATE sessions SET last_activity_at=now() WHERE id=$1', [row.id]);
