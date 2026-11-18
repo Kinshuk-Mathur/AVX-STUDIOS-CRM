@@ -1,34 +1,37 @@
-# Verification — 17 November 2026
+# Firestore migration verification — 18 November 2026
 
-Final project: `/Users/kinshukmathur/developer/avx crm`
+Verified in /Users/kinshukmathur/Developer/avx crm.
 
-## Passed
+## Automated checks
 
-- TypeScript strict check: passed.
-- ESLint: passed, no errors or warnings.
-- Automated integration and arithmetic checks: **22 passed, 0 failed**.
-- Production build: passed with Next.js 16.4.6, React 19.3.1 and TypeScript 6.0.3.
-- Dependency audit at install: 0 known vulnerabilities reported.
-- Clean installation lockfile check: `npm ci --dry-run` passed.
-- Local `/login` HTTP response: 200.
-- HTTP workflow smoke test against an isolated test database: owner login; client/project/invoice creation; ₹8,000 payment; stored PDF download; owner SSE access-request event; viewer pending authorization, approval, allowed project read, forbidden financial read and writes, revocation; CSV export; logout.
+- ESLint: passed.
+- TypeScript: passed.
+- Next.js production build: passed.
+- Official Firestore emulator integration suite: **21 tests passed, 0 failed**.
+- npm audit --omit=dev: **0 known production vulnerabilities** at verification time. Development tooling has separate audit findings; this is not a claim that every development dependency is vulnerability-free.
+- Git diff whitespace check: passed.
+- Deployment tracing: five manifests checked; private credential JSON, local environment files, business-data directories and source backups excluded. PDF font included in API bundle.
 
-The automated suite covers all 13 requested financial/authorization scenarios, plus exact rounding, idempotency/concurrent retries, overpayment rejection, single-owner enforcement, immutable financial history, account expiry, quote conversion, issuing draft PDFs and CSRF rejection. The final privacy checks also verify that financial documents cannot expose hidden client data through raw viewer-role database queries or PDF APIs.
+Tests cover exact paise arithmetic; linked catalog records; invoice balances; payment/refund idempotency under concurrent retries; overpayment rejection; immutable receipt PDFs; historical snapshots; quotation conversion; draft issue; owner recovery and global session invalidation; atomic setup import; viewer approval per device; live Firestore-driven approval events; repository/API permissions; revocation/expiry; financial redaction; private 2 MB attachment round-trip; CSRF; denied unauthenticated Firestore access.
 
-A refund date comparison failed in the first test pass because the local PostgreSQL engine returned a Date object. The query now explicitly returns an ISO date string. A draft document's PDF status is now regenerated transactionally when issued. Both cases passed the final suite.
+The emulator used demo-avx-tests on loopback, isolated workspace IDs and temporary files. Test workspaces were deleted. No test owner/client/payment records were written to the live project.
 
-## Not verified externally
+## Live Firebase verification
 
-- Native browser automation timed out. No completed visual or browser click-through verification is claimed. The responsive UI is implemented, type-checked and built; its login route was served successfully.
-- No production PostgreSQL provider, public deployment, real email delivery, multi-host proxy configuration or backup restoration was tested. These require the owner's deployment configuration.
-- No independent security audit or load test was performed.
+- Server read access to avx-crm-509a3 / (default) verified.
+- Firestore field-index exclusions deployed successfully.
+- Legacy local database backed up before import.
+- Source contained one owner, zero viewers and zero business records.
+- Existing owner, settings, service categories and audit history imported atomically into avx_workspaces/primary.
+- Target verified against source: identical owner ID, username and password hash; exactly one owner.
+- Local HTTP smoke checks against the real Firebase backend: /login 200; /api/auth/state 200; protected /api/clients without a session 401; nonexistent credentials 401 with a normal authentication error.
 
-## Test data
+## Remaining deployment steps / limits
 
-Automated tests use isolated in-memory PostgreSQL. HTTP smoke tests used a separate temporary PGlite directory and generated credentials. The temporary browser test data and credentials were removed. No real business records or permanent owner credentials were created.
+The updated code and Netlify environment variables have **not** been deployed to the live Netlify site. Local validation does not establish that the existing live deployment has been fixed.
 
-See README.md for implemented features and known limits, and docs/DEPLOYMENT.md for database roles, environment, initialization, deployment and backup instructions.
+Add FIREBASE_PROJECT_ID, secret FIREBASE_SERVICE_ACCOUNT_JSON and APP_ORIGIN, then deploy the updated repository code. Production Netlify Blobs access and an actual owner browser login on the deployed site still need verification. Real receipt email, cloud backup scheduling/restoration, malware scanning and large-volume performance were not tested or configured.
 
-## Owner recovery update
+The default local system has no Java installation. Emulator checks were run using a freshly downloaded, SHA-256 verified official Eclipse Temurin Java 21 runtime in a task-local directory. Install Java 21+ or set JAVA_HOME before future npm test runs.
 
-Owner setup/recovery now uses a trusted CLI-generated, single-use 30-minute link and a browser credential form. The complete suite passes **28 tests**, including initial owner creation, token hashing, expired/reused/invalid links, competing redemptions, preserved owner ID and business records, session revocation, CSRF, and absence of a public link issuer. TypeScript, ESLint and production build also pass. A local database backup was taken before activating recovery; no new password has been selected for the user.
+The existing UI retains a 1,000-record list cap. The legacy setup importer deliberately refuses sources containing business records and targets that are already initialized.

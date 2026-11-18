@@ -1,97 +1,63 @@
-import { randomBytes, scrypt, timingSafeEqual, createHash } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { AppError, insist } from './errors';
-import { one, transaction } from './db';
-import { sections, type Principal, type Section } from '@/lib/domain';
-const derive = (
-  password: string,
-  salt: string,
-  length: number,
-  options: { N: number; r: number; p: number; maxmem: number },
-): Promise<Buffer> =>
-  new Promise((resolve, reject) =>
-    scrypt(password, salt, length, options, (error, key) => (error ? reject(error) : resolve(key))),
-  );
-const OPTIONS = { N: 131072, r: 8, p: 1, maxmem: 256 * 1024 * 1024 };
-export const COOKIE = 'avx_session';
-export const hashToken = (value: string) => createHash('sha256').update(value).digest('hex');
-export async function hashPassword(password: string) {
-  insist(
-    password.length >= 12 && password.length <= 128,
-    'Use a password between 12 and 128 characters.',
-  );
-  const salt = randomBytes(16).toString('hex');
-  const key = (await derive(password, salt, 64, OPTIONS)) as Buffer;
-  return `scrypt$${salt}$${key.toString('hex')}`;
-}
-export async function verifyPassword(password: string, hash: string) {
-  const [, salt, hex] = hash.split('$');
-  if (!salt || !hex) return false;
-  const key = (await derive(password, salt, 64, OPTIONS)) as Buffer;
-  const stored = Buffer.from(hex, 'hex');
-  return stored.length === key.length && timingSafeEqual(key, stored);
-}
-export function assertOwner(p: Principal) {
-  insist(p.role === 'owner', 'Owner access is required.', 403);
-}
-export function assertSection(p: Principal, section: Section) {
-  insist(
-    p.role === 'owner' || p.permissions.includes(section),
-    'This section is not available to your account.',
-    403,
-  );
-}
-export function cookieToken(request: Request) {
-  return request.headers
-    .get('cookie')
-    ?.split(';')
-    .map((s) => s.trim())
-    .find((s) => s.startsWith(`${COOKIE}=`))
-    ?.slice(COOKIE.length + 1);
-}
-export function sessionCookie(token: string, clear = false) {
-  const secure = process.env.NODE_ENV === 'production';
-  return `${COOKIE}=${clear ? '' : token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${clear ? 0 : 43200}${secure ? '; Secure' : ''}`;
-}
-export function checkOrigin(request: Request) {
-  const origin = request.headers.get('origin');
-  const expected = process.env.APP_ORIGIN || new URL(request.url).origin;
-  insist(origin === expected, 'Request origin was rejected.', 403);
-  const site = request.headers.get('sec-fetch-site');
-  insist(
-    !site || site === 'same-origin' || site === 'none',
-    'Cross-site requests are not allowed.',
-    403,
-  );
-}
-export async function throttle(key: string, limit = 8, minutes = 15) {
-  const blocked = await transaction(async (tx) => {
-    const row = await one<{ attempts: number }>(
-      tx,
-      "INSERT INTO login_limits(key,attempts,reset_at) VALUES($1,1,now()+($2||' minutes')::interval) ON CONFLICT(key) DO UPDATE SET attempts=CASE WHEN login_limits.reset_at<now() THEN 1 ELSE login_limits.attempts+1 END,reset_at=CASE WHEN login_limits.reset_at<now() THEN excluded.reset_at ELSE login_limits.reset_at END RETURNING attempts",
-      [hashToken(key), String(minutes)],
-    );
-    return row!.attempts > limit;
-  });
-  if (blocked) throw new AppError(429, 'Too many attempts. Please try again later.');
-}
+import { transaction, get, newRow, now, accessAudit } from './firebase/store';
+import type { Account, Session, AccessMeta, Settings } from './firebase/models';
+import { sections, type Principal } from '@/lib/domain';
+import { hashToken, verifyPassword, cookieToken } from './security-primitives';
+export * from './security-primitives';
+export type SessionState =
+  | { status: 'approved'; principal: Principal }
+  | {
+      status: 'signed-out' | 'pending' | 'rejected' | 'revoked' | 'expired';
+      principal?: undefined;
+    };
 export function clientAddress(request: Request) {
   return process.env.TRUST_PROXY === 'true'
     ? request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown'
     : 'local';
 }
-type StoredSessionStatus = 'pending' | 'approved' | 'rejected' | 'revoked' | 'expired';
-export type SessionState =
-  | { status: 'approved'; principal: Principal }
-  | { status: Exclude<StoredSessionStatus, 'approved'> | 'signed-out'; principal?: undefined };
-
-interface SessionRow {
-  id: string;
-  owner_id: string | null;
-  viewer_id: string | null;
-  status: StoredSessionStatus;
-  name: string;
-  permissions: Section[];
-  valid: boolean;
+export async function throttle(key: string, limit = 8, minutes = 15) {
+  const blocked = await transaction(async (tx) => {
+    const id = hashToken(key),
+      old = await tx.get('login_limits', id);
+    const expired = !old || String(old.reset_at) < now();
+    const attempts = expired ? 1 : Number(old!.attempts) + 1;
+    const row = {
+      id,
+      attempts,
+      reset_at: expired ? new Date(Date.now() + minutes * 60000).toISOString() : old!.reset_at,
+    };
+    if (old) await tx.update('login_limits', id, row);
+    else await tx.create('login_limits', row);
+    return attempts > limit;
+  });
+  if (blocked) throw new AppError(429, 'Too many attempts. Please try again later.');
+}
+export function effectiveSessionStatus(
+  s: Session,
+  a: Account | undefined,
+  meta: AccessMeta | undefined,
+) {
+  if (['rejected', 'revoked', 'expired'].includes(s.status)) return s.status;
+  if (
+    !a ||
+    !meta ||
+    s.auth_epoch !== meta.auth_epoch ||
+    s.account_version !== a.session_version ||
+    s.revoked_at ||
+    (s.viewer_id && a.status !== 'Active')
+  )
+    return 'revoked';
+  const timestamp = now();
+  if (
+    s.expires_at <= timestamp ||
+    (s.status === 'pending' && s.request_expires_at <= timestamp) ||
+    (s.viewer_id &&
+      ((a.expires_at && a.expires_at <= timestamp) ||
+        s.last_activity_at <= new Date(Date.now() - s.idle_minutes * 60000).toISOString()))
+  )
+    return 'expired';
+  return s.status;
 }
 export async function sessionState(
   token: string | undefined,
@@ -99,32 +65,31 @@ export async function sessionState(
 ): Promise<SessionState> {
   if (!token) return { status: 'signed-out' };
   return transaction<SessionState>(async (tx) => {
-    const row = await one<SessionRow>(
-      tx,
-      `SELECT s.id,s.owner_id,s.viewer_id,s.status,coalesce(o.display_name,v.display_name) AS name,
-      coalesce((SELECT array_agg(section) FROM viewer_permissions WHERE viewer_id=v.id),'{}') AS permissions,
-      (s.revoked_at IS NULL AND s.expires_at>now() AND (s.owner_id IS NOT NULL OR (v.status='Active' AND (v.expires_at IS NULL OR v.expires_at>now()) AND s.last_activity_at>now()-(s.idle_minutes||' minutes')::interval)) AND (s.status<>'pending' OR s.request_expires_at>now())) AS valid
-      FROM sessions s LEFT JOIN owners o ON o.id=s.owner_id LEFT JOIN viewer_accounts v ON v.id=s.viewer_id WHERE s.token_hash=$1`,
-      [hashToken(token)],
+    const index = await tx.get('session_tokens', hashToken(token));
+    if (!index) return { status: 'signed-out' };
+    const s = await tx.get<Session>('sessions', String(index.session_id));
+    if (!s) return { status: 'signed-out' };
+    const a = await tx.get<Account>(
+      s.owner_id ? 'owners' : 'viewer_accounts',
+      (s.owner_id || s.viewer_id)!,
     );
-    if (!row) return { status: 'signed-out' };
-    if (!row.valid) {
-      if (['pending', 'approved'].includes(row.status))
-        await tx.query("UPDATE sessions SET status='expired' WHERE id=$1", [row.id]);
-      return {
-        status: row.status === 'rejected' || row.status === 'revoked' ? row.status : 'expired',
-      };
+    const meta = await tx.get<AccessMeta>('meta', 'access');
+    const status = effectiveSessionStatus(s, a, meta);
+    if (status !== 'approved') {
+      if (status !== s.status) await tx.update('sessions', s.id, { status });
+      return { status: status as 'pending' | 'rejected' | 'revoked' | 'expired' };
     }
-    if (row.status !== 'approved') return { status: row.status };
-    if (touch) await tx.query('UPDATE sessions SET last_activity_at=now() WHERE id=$1', [row.id]);
-    const principal: Principal = {
-      id: (row.owner_id || row.viewer_id)!,
-      name: row.name,
-      role: row.owner_id ? 'owner' : 'viewer',
-      permissions: row.owner_id ? [...sections] : row.permissions,
-      sessionId: row.id,
+    if (touch) await tx.update('sessions', s.id, { last_activity_at: now() });
+    return {
+      status: 'approved',
+      principal: {
+        id: a!.id,
+        name: a!.display_name,
+        role: s.owner_id ? 'owner' : 'viewer',
+        permissions: s.owner_id ? [...sections] : a!.permissions || [],
+        sessionId: s.id,
+      },
     };
-    return { status: 'approved', principal };
   });
 }
 export async function authenticate(request: Request, touch = true) {
@@ -139,61 +104,70 @@ export async function authenticate(request: Request, touch = true) {
   return state.principal;
 }
 export async function login(username: string, password: string, viewer: boolean, device: string) {
-  const account = await transaction((tx) =>
-    one<{ id: string; password_hash: string; display_name: string; valid: boolean }>(
-      tx,
-      viewer
-        ? "SELECT id,password_hash,display_name,(status='Active' AND (expires_at IS NULL OR expires_at>now())) AS valid FROM viewer_accounts WHERE username=$1"
-        : 'SELECT id,password_hash,display_name,true AS valid FROM owners WHERE username=$1',
-      [username.toLowerCase().trim()],
-    ),
+  username = username.toLowerCase().trim();
+  const account = await transaction(async (tx) => {
+    if (viewer) {
+      const index = await tx.get('usernames', hashToken('viewer:' + username));
+      return index ? tx.get<Account>('viewer_accounts', String(index.account_id)) : undefined;
+    }
+    const meta = await tx.get<AccessMeta>('meta', 'access');
+    const a = meta?.owner_id ? await tx.get<Account>('owners', meta.owner_id) : undefined;
+    return a?.username === username ? a : undefined;
+  });
+  const verified = await verifyPassword(
+    password,
+    account?.password_hash || 'scrypt$' + '0'.repeat(32) + '$' + '0'.repeat(128),
   );
-  const dummy = `scrypt$${'0'.repeat(32)}$${'0'.repeat(128)}`;
-  const verified = await verifyPassword(password, account?.password_hash || dummy);
-  insist(account && verified && account.valid, 'Unable to sign in with those credentials.', 401);
+  insist(account && verified, 'Unable to sign in with those credentials.', 401);
   const token = randomBytes(32).toString('base64url');
-  await transaction(
-    async (tx) => {
-      const policy = await one<{
-        data: { requestTimeoutMinutes?: number; sessionMinutes?: number; idleMinutes?: number };
-      }>(tx, 'SELECT data FROM agency_settings');
-      const settings = policy?.data || {};
-      const session = await one<{ id: string }>(
-        tx,
-        `INSERT INTO sessions(token_hash,${viewer ? 'viewer_id' : 'owner_id'},status,device,request_expires_at,expires_at,idle_minutes,approved_at) VALUES($1,$2,$3,$4,now()+($5||' minutes')::interval,now()+($6||' minutes')::interval,$7,${viewer ? 'NULL' : 'now()'}) RETURNING id`,
-        [
-          hashToken(token),
-          account.id,
-          viewer ? 'pending' : 'approved',
-          device.slice(0, 300),
-          String(settings.requestTimeoutMinutes || 5),
-          String(viewer ? settings.sessionMinutes || 60 : 720),
-          settings.idleMinutes || 15,
-        ],
-      );
-      await tx.query('INSERT INTO access_audit_logs(viewer_id,session_id,event) VALUES($1,$2,$3)', [
-        viewer ? account.id : null,
-        session!.id,
-        viewer ? 'access_requested' : 'owner_login',
-      ]);
-      if (viewer)
-        await tx.query('UPDATE viewer_accounts SET last_login=now() WHERE id=$1', [account.id]);
-    },
-    {
-      id: account.id,
-      name: account.display_name,
-      role: 'owner',
-      permissions: [...sections],
-      sessionId: '',
-    },
-  );
+  await transaction(async (tx) => {
+    const a = await tx.get<Account>(viewer ? 'viewer_accounts' : 'owners', account.id);
+    insist(
+      a &&
+        a.password_hash === account.password_hash &&
+        (!viewer || (a.status === 'Active' && (!a.expires_at || a.expires_at > now()))),
+      'Unable to sign in with those credentials.',
+      401,
+    );
+    const meta = await tx.get<AccessMeta>('meta', 'access');
+    insist(meta, 'Initialize the workspace before signing in.', 503);
+    const policy = await tx.get<Settings>('agency_settings', 'agency');
+    const settings = policy?.data || {};
+    const time = Date.now();
+    const s = newRow({
+      token_hash: hashToken(token),
+      owner_id: viewer ? null : a.id,
+      viewer_id: viewer ? a.id : null,
+      status: viewer ? 'pending' : 'approved',
+      device: device.slice(0, 300),
+      request_expires_at: new Date(
+        time + Number(settings.requestTimeoutMinutes || 5) * 60000,
+      ).toISOString(),
+      expires_at: new Date(
+        time + Number(viewer ? settings.sessionMinutes || 60 : 720) * 60000,
+      ).toISOString(),
+      idle_minutes: Number(settings.idleMinutes || 15),
+      last_activity_at: now(),
+      approved_at: viewer ? null : now(),
+      account_version: a.session_version,
+      auth_epoch: meta.auth_epoch,
+    });
+    await tx.create('sessions', s);
+    await tx.create('session_tokens', {
+      id: hashToken(token),
+      session_id: s.id,
+      expires_at: s.expires_at,
+    });
+    await accessAudit(tx, viewer ? 'access_requested' : 'owner_login', viewer ? a.id : null, s.id);
+    if (viewer) await tx.update('viewer_accounts', a.id, { last_login: now() });
+  });
   return { token, status: viewer ? 'pending' : 'approved' };
 }
 export async function logout(token: string | undefined) {
-  if (token)
-    await transaction(async (tx) => {
-      await tx.query("UPDATE sessions SET status='revoked',revoked_at=now() WHERE token_hash=$1", [
-        hashToken(token),
-      ]);
-    });
+  if (!token) return;
+  const index = await get('session_tokens', hashToken(token));
+  if (index)
+    await transaction((tx) =>
+      tx.update('sessions', String(index.session_id), { status: 'revoked', revoked_at: now() }),
+    );
 }

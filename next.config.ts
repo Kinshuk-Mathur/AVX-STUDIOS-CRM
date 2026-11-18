@@ -1,6 +1,23 @@
 import type { NextConfig } from 'next';
 const nextConfig: NextConfig = {
-  serverExternalPackages: ['@electric-sql/pglite', 'pg'],
+  serverExternalPackages: [
+    '@electric-sql/pglite',
+    'pg',
+    'firebase-admin',
+    '@google-cloud/firestore',
+  ],
+  outputFileTracingIncludes: { '/api/*': ['./public/NotoSans-Regular.ttf'] },
+  outputFileTracingExcludes: {
+    '/*': [
+      './avx-crm.json',
+      './*service-account*.json',
+      './*-firebase-adminsdk-*.json',
+      './.secrets/**/*',
+      './.env*',
+      './.data/**/*',
+      './work/**/*',
+    ],
+  },
   poweredByHeader: false,
   outputFileTracingRoot: process.cwd(),
   async headers() {

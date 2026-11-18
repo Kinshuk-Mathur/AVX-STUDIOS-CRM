@@ -7,3 +7,13 @@ node_modules/
 coverage/
 .DS_Store
 work/
+
+# Firebase server credentials
+.secrets/
+*service-account*.json
+*-firebase-adminsdk-*.json
+avx-crm.json
+
+# Emulator diagnostic logs
+*-debug.log
+*-debug.*.log

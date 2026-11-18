@@ -1,62 +1,88 @@
-import { cookieToken, sessionState } from '@/server/security';
-import { transaction } from '@/server/db';
+import { cookieToken, sessionState, hashToken } from '@/server/security';
+import { get, workspace } from '@/server/firebase/store';
+import { pendingRequests } from '@/server/services/viewers';
+import type { Session } from '@/server/firebase/models';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export async function GET(request: Request) {
   const token = cookieToken(request);
   const initial = await sessionState(token);
-  if (initial.status === 'signed-out') return new Response(null, { status: 401 });
+  if (!token || !['approved', 'pending'].includes(initial.status))
+    return new Response(null, { status: 401 });
+  const index = await get('session_tokens', hashToken(token));
+  const session = index ? await get<Session>('sessions', String(index.session_id)) : undefined;
+  if (!session) return new Response(null, { status: 401 });
+  const root = await workspace();
   const encoder = new TextEncoder();
   let cleanup = () => {};
   const stream = new ReadableStream({
     start(controller) {
-      let cancelled = false,
+      let closed = false,
         running = false,
-        tick = 0;
+        dirty = false;
+      let scheduled: ReturnType<typeof setTimeout> | undefined;
+      const unsubscribe: (() => void)[] = [];
       const close = () => {
-        if (cancelled) return;
-        cancelled = true;
-        clearInterval(timer);
+        if (closed) return;
+        closed = true;
         clearTimeout(timeout);
+        clearTimeout(scheduled);
+        for (const stop of unsubscribe) stop();
         request.signal.removeEventListener('abort', close);
         try {
           controller.close();
         } catch {}
       };
-      cleanup = close;
       const send = async () => {
-        if (cancelled || running) return;
+        scheduled = undefined;
+        if (closed) return;
+        if (running) {
+          dirty = true;
+          return;
+        }
         running = true;
         try {
           const state = await sessionState(token, false);
-          const payload: Record<string, unknown> = {
-            status: state.status,
-            reconcile: tick++ % 5 === 0,
-          };
+          const payload: Record<string, unknown> = { status: state.status, reconcile: true };
           if (state.principal?.role === 'owner')
-            payload.requests = await transaction(
-              async (tx) =>
-                (
-                  await tx.query(
-                    "SELECT s.id,s.device,s.created_at,v.display_name,v.username FROM sessions s JOIN viewer_accounts v ON v.id=s.viewer_id WHERE s.status='pending' AND s.request_expires_at>now() AND v.status='Active' AND (v.expires_at IS NULL OR v.expires_at>now()) ORDER BY s.created_at",
-                  )
-                ).rows,
-              state.principal,
-            );
-          if (!cancelled)
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+            payload.requests = await pendingRequests(state.principal);
+          if (!closed)
+            controller.enqueue(encoder.encode('data: ' + JSON.stringify(payload) + '\n\n'));
           if (!['pending', 'approved'].includes(state.status)) close();
         } catch {
-          if (!cancelled) controller.enqueue(encoder.encode('event: reconnect\ndata: {}\n\n'));
+          if (!closed) controller.enqueue(encoder.encode('event: reconnect\ndata: {}\n\n'));
           close();
         } finally {
           running = false;
+          if (dirty && !closed) {
+            dirty = false;
+            schedule();
+          }
         }
       };
-      const timer = setInterval(send, 2000);
+      const schedule = () => {
+        if (!closed && !scheduled) scheduled = setTimeout(() => void send(), 50);
+      };
       const timeout = setTimeout(close, 55000);
+      cleanup = close;
       request.signal.addEventListener('abort', close);
-      void send();
+      if (request.signal.aborted) {
+        close();
+        return;
+      }
+      for (const ref of [
+        root.collection('sessions').doc(session.id),
+        root
+          .collection(session.owner_id ? 'owners' : 'viewer_accounts')
+          .doc((session.owner_id || session.viewer_id)!),
+        root.collection('meta').doc('access'),
+      ])
+        unsubscribe.push(ref.onSnapshot(schedule, close));
+      if (initial.principal?.role === 'owner')
+        unsubscribe.push(
+          root.collection('sessions').where('status', '==', 'pending').onSnapshot(schedule, close),
+        );
+      schedule();
     },
     cancel() {
       cleanup();

@@ -233,7 +233,24 @@ async function handler(request: Request, { params }: { params: Promise<{ path: s
         400,
       );
     if (error instanceof AppError) return json({ error: error.message }, error.status);
-    const code = (error as { code?: string }).code;
+    const code = (error as { code?: string | number }).code;
+    if (code === 6)
+      return json({ error: 'This record already exists. Refresh before retrying.' }, 409);
+    if (code === 10)
+      return json({ error: 'Another change was being saved. Please try again.' }, 409);
+    if (code === 8)
+      return json(
+        { error: 'The workspace is temporarily at capacity. Please try again later.' },
+        429,
+      );
+    if (code === 14 || (error as Error).name === 'FirebaseConfigurationError')
+      return json(
+        {
+          error:
+            'The workspace database is unavailable. Please check the server configuration or try again shortly.',
+        },
+        503,
+      );
     if (code === '23505')
       return json(
         {

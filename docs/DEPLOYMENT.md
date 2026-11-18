@@ -1,68 +1,29 @@
-# Production deployment
+# Netlify deployment
 
-## PostgreSQL
+1. Connect the repository and build with `npm run build` using Node.js 22.9+.
+2. In **Project configuration → Environment variables**, add the following for **Production**, scope **Functions**:
+   - `FIREBASE_PROJECT_ID`: `avx-crm-509a3`
+   - `FIREBASE_SERVICE_ACCOUNT_JSON`: the entire service-account JSON, marked secret.
+   - `APP_ORIGIN`: `https://avxstudioscrm.netlify.app`
+3. Do not deploy `GOOGLE_APPLICATION_CREDENTIALS` pointing to a Mac path. Remove obsolete `DATABASE_URL` if present. No `NEXT_PUBLIC_` variables are needed.
+4. Deploy the Firestore migration commit, then test owner login, client creation, an invoice/PDF and viewer approval.
+5. Netlify Blobs is automatically available to the Next.js server functions. The private `avx-private-files` store persists across deployments; the app authorizes downloads.
+6. Optional receipt email uses `RESEND_API_KEY`, `EMAIL_FROM`, and `OWNER_COPY_EMAIL`.
 
-Use PostgreSQL 15+ with TLS, automated backups, point-in-time recovery and a tested restore process. Supabase's direct/session database endpoint or another managed PostgreSQL provider is suitable. Avoid disabling TLS certificate verification.
+If scope selection is unavailable, use all scopes. Do not share production secrets with untrusted deploy-preview contexts. Set a separate Firestore project/workspace for previews.
 
-Run the migration with a trusted admin connection from a maintenance environment:
+## Initial setup and recovery
 
-```sh
-DATABASE_ADMIN_URL='postgresql://ADMIN:SECRET@HOST:5432/DB?sslmode=verify-full' npm run db:migrate
-```
+The existing local owner account can be imported before initializing the empty target. The setup importer refuses populated business databases and refuses overwriting an initialized Firestore target. Back up the old local directory first.
 
-Create a dedicated login role through your provider/secret manager. Supply a strong generated password privately, not in source control or shell history. Grant it membership in both application roles:
+For a genuinely new workspace: run `npm run db:migrate`, then `npm run owner:setup` from a trusted terminal configured for the production Firebase project. Use `APP_ORIGIN=https://avxstudioscrm.netlify.app npm run owner:setup` to print a production URL. The private link can reset the existing owner without deleting business data.
 
-```sql
--- avx_runtime must be created with LOGIN and a secret managed outside this file.
-ALTER ROLE avx_runtime NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE;
-GRANT avx_app, avx_readonly TO avx_runtime;
-```
+## Storage and operations
 
-The server explicitly selects `avx_app` for authentication/owner operations and `avx_readonly` for viewer business reads inside each transaction. Viewer roles have no write privileges, and business SELECTs are further restricted by section RLS. Runtime credentials stay server-side; never expose the database directly to a browser. The server is the only authority that sets role/section transaction claims.
+Firestore transactions atomically update payments, refunds, balances, daily rollups, and uniqueness guards. PDF/blob writes occur before the transaction commits. An unsuccessful/retried transaction can leave an unreferenced blob; its random-looking content hash is not a public URL, and the download API requires a committed metadata record and an authorized session.
 
-The `avx_app` role must not own tables and must not have BYPASSRLS. `SET LOCAL ROLE` drops migration-owner privileges for application transactions. Administrative connections must not be used as browser-accessible APIs. Keep `DATABASE_ADMIN_URL` out of the web runtime.
+Back up Firestore and the private Netlify Blobs store. CSV exports alone do not include PDFs, uploads, credentials or complete audit history. Confirm backup/export features supported by your Firebase plan before adopting a backup schedule. No billing-plan upgrade is performed here.
 
-Initialize the single owner with the admin connection in a trusted terminal, then discard that environment's secret:
+The official Firestore emulator requires Java 21+. Run `npm test` locally before deployment. Real-provider receipt email and cloud backup restoration require separate verification.
 
-```sh
-DATABASE_ADMIN_URL='postgresql://...' npm run owner:create
-```
-
-Set runtime `DATABASE_URL` to the restricted login, `APP_ORIGIN` to your HTTPS origin, and the optional Resend configuration. Review agency settings, tax details and document prefixes before issuing live documents. GST is optional and is never invented.
-
-## Host
-
-Use a Node.js 22.9+ host or container with persistent PostgreSQL connectivity. The app is a Node server, not a static export. Long-lived server-sent event requests are used for viewer approvals. A container host is recommended so event connections can remain open for up to 55 seconds, reconnect, and scale across instances without in-memory authorization state.
-
-```sh
-npm ci
-npm run lint
-npm run typecheck
-npm test
-npm run build
-npm start
-```
-
-Ensure the deployment includes `public/NotoSans-Regular.ttf` and `src/server/db/schema.sql`. The standard repository-based deployment includes both. Do not run PGlite on a serverless filesystem or run multiple processes against its local directory.
-
-At your reverse proxy: terminate HTTPS, disable buffering/caching for `/api/events`, set appropriate request timeouts and a maximum body size around 7 MB, replace forwarded client-IP headers, and set `TRUST_PROXY=true` only when those headers are trusted. Add network-layer login throttling and operational monitoring. Verify secure cookies over HTTPS. The development binding is loopback; production binds to all interfaces behind the proxy.
-
-## Email and notifications
-
-Verify the Resend sender domain, configure `RESEND_API_KEY`, `EMAIL_FROM` and optionally `OWNER_COPY_EMAIL`, and test with your own recipient. The app records provider acceptance; integrate signed provider webhooks if inbox-delivered/bounced events are required.
-
-Owner desktop notifications require browser permission and an open connected app. No offline Web Push subscription or service worker is configured. The persistent approval queue remains available from any owner session.
-
-## Backup and recovery
-
-Use provider snapshots/PITR and periodically verify a full restore into an isolated environment. Include application roles/grants and the full schema; receipts and uploaded attachments live in the database. Encrypted exports contain private information and must have restricted access.
-
-For local development, stop all app processes before copying the entire `.data/avx` directory. A PGlite directory is not a PostgreSQL server data directory; migrate to managed PostgreSQL via a logical dump/import workflow and verify totals/allocations before switching. Do not copy its files directly into a PostgreSQL server.
-
-## Release verification
-
-Validate owner login and password rotation, viewer pending/approve/reject/revoke on two devices, section isolation, an invoice with partial and final payments, PDF download, refund reconciliation, actual email receipt delivery, backup restoration and multi-instance SSE reconciliation in the target environment. Local integration tests do not replace this deployment verification.
-
-## Owner recovery
-
-Apply schema migration 2 before deploying the recovery UI. Generate a one-use recovery link with `npm run owner:setup` from a trusted server terminal with the appropriate database connection and canonical HTTPS `APP_ORIGIN`. This operation does not reset credentials until the form is submitted. The link expires in 30 minutes. Recovery preserves business records and revokes existing owner/viewer sessions. Keep administrative terminal access and the printed link private. Stop a local PGlite web process before running this CLI, then restart it to use the form.
+The legacy PostgreSQL adapter is only retained for reading the pre-migration setup. It is not imported by any web route or runtime data service.

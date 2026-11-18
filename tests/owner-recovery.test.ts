@@ -1,167 +1,139 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID, randomBytes } from 'node:crypto';
+import { fixture } from './firestore-fixture';
 import { issueOwnerRecovery, redeemOwnerRecovery } from '../src/server/services/owner-recovery';
-import { transaction, one, closeDb } from '../src/server/db';
+import { transaction, get, list, workspace } from '../src/server/firebase/store';
 import { login, sessionState, hashToken } from '../src/server/security';
 import { saveClient } from '../src/server/services/catalog';
+import { importLegacySetup } from '../src/server/firebase/import-legacy-setup';
 import { POST } from '../src/app/api/[...path]/route';
 
-process.env.PGLITE_DATA_DIR = 'memory://';
-delete process.env.DATABASE_URL;
-process.env.APP_ORIGIN = 'http://localhost:3000';
-
 test('trusted one-use owner setup and recovery', async (t) => {
-  let originalOwnerId: string;
-  let previousSession: string;
-  let clientId: string;
+  t.after(await fixture());
   let password = 'recovery-' + randomUUID();
-  t.after(closeDb);
-  {
-    await t.test('a private token creates exactly one owner and stores only its hash', async () => {
-      const token = await issueOwnerRecovery();
-      const stored = await transaction((tx) =>
-        one<{ token_hash: string }>(
-          tx,
-          'SELECT token_hash FROM owner_recovery_tokens WHERE consumed_at IS NULL',
-        ),
-      );
-      assert.equal(stored!.token_hash, hashToken(token));
-      assert.notEqual(stored!.token_hash, token);
-      await redeemOwnerRecovery(
-        { token, username: 'owner', name: 'Original Owner', password },
-        'local',
-      );
-      const signedIn = await login('owner', password, false, 'Test');
-      previousSession = signedIn.token;
-      const ownerState = await sessionState(previousSession);
-      assert.equal(ownerState.status, 'approved');
-      assert.ok(ownerState.principal);
-      const owner = ownerState.principal;
-      originalOwnerId = owner.id;
-      clientId = String((await saveClient(owner, { name: 'Preserved client' })).id);
+  const token = await issueOwnerRecovery();
+  const stored = await get('meta', 'access');
+  assert.equal(stored!.recovery_hash, hashToken(token));
+  assert.notEqual(stored!.recovery_hash, token);
+  await redeemOwnerRecovery(
+    { token, username: 'owner', name: 'Original Owner', password },
+    'local',
+  );
+  const previousSession = (await login('owner', password, false, 'Test')).token;
+  const state = await sessionState(previousSession);
+  assert.ok(state.principal);
+  const originalOwner = state.principal;
+  const clientId = String((await saveClient(originalOwner, { name: 'Preserved client' })).id);
+  await t.test('used, invalid, expired and replaced links never change credentials', async () => {
+    const payload = { username: 'other', name: 'Other', password };
+    for (const invalid of [token, randomBytes(32).toString('base64url')])
       await assert.rejects(
-        redeemOwnerRecovery({ token, username: 'attacker', name: 'Other', password }, 'local'),
+        redeemOwnerRecovery({ ...payload, token: invalid }, 'local'),
         /invalid, expired, or already used/,
       );
-    });
-    await t.test('invalid and expired tokens never change credentials', async () => {
-      await assert.rejects(
-        redeemOwnerRecovery(
-          {
-            token: randomBytes(32).toString('base64url'),
-            username: 'other',
-            name: 'Other',
-            password,
-          },
-          'local',
-        ),
-        /invalid, expired, or already used/,
-      );
-      const token = await issueOwnerRecovery();
-      await transaction((tx) =>
-        tx.query(
-          "UPDATE owner_recovery_tokens SET expires_at=now()-interval '1 minute' WHERE token_hash=$1",
-          [hashToken(token)],
-        ),
-      );
-      await assert.rejects(
-        redeemOwnerRecovery({ token, username: 'other', name: 'Other', password }, 'local'),
-        /invalid, expired, or already used/,
-      );
-      assert.equal((await sessionState(previousSession)).status, 'approved');
-    });
-    await t.test('issuing a new link invalidates older unconsumed links', async () => {
-      const old = await issueOwnerRecovery();
-      const fresh = await issueOwnerRecovery();
-      await assert.rejects(
-        redeemOwnerRecovery({ token: old, username: 'other', name: 'Other', password }, 'local'),
-        /invalid, expired, or already used/,
-      );
-      const count = await transaction((tx) =>
-        one<{ count: string }>(
-          tx,
-          'SELECT count(*)::text AS count FROM owner_recovery_tokens WHERE consumed_at IS NULL',
-        ),
-      );
-      assert.equal(count!.count, '1');
-      assert.notEqual(fresh, old);
-    });
-    await t.test(
-      'recovery keeps the owner ID and records, revokes sessions, and permits one concurrent redemption',
-      async () => {
-        const token = await issueOwnerRecovery();
-        const oldPassword = password;
-        password = 'new-' + randomUUID();
-        const payload = { token, username: 'kinshuk@avxstudios', name: 'Kinshuk', password };
-        const results = await Promise.allSettled([
-          redeemOwnerRecovery(payload, 'local'),
-          redeemOwnerRecovery(payload, 'local'),
-        ]);
-        assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
-        assert.equal(results.filter((r) => r.status === 'rejected').length, 1);
-        assert.equal((await sessionState(previousSession)).status, 'revoked');
-        await assert.rejects(login('owner', oldPassword, false, 'Test'), /Unable to sign in/);
-        const session = await login(payload.username, password, false, 'Test');
-        const recoveredState = await sessionState(session.token);
-        assert.equal(recoveredState.status, 'approved');
-        assert.ok(recoveredState.principal);
-        const principal = recoveredState.principal;
-        assert.equal(principal.id, originalOwnerId);
-        const client = await transaction(
-          (tx) => one<{ name: string }>(tx, 'SELECT name FROM clients WHERE id=$1', [clientId]),
-          principal,
-        );
-        assert.equal(client!.name, 'Preserved client');
-        const count = await transaction((tx) =>
-          one<{ count: string }>(tx, 'SELECT count(*)::text AS count FROM owners'),
-        );
-        assert.equal(count!.count, '1');
-        await assert.rejects(
-          transaction((tx) => tx.query('SELECT token_hash FROM owner_recovery_tokens'), {
-            ...principal,
-            role: 'viewer',
-            permissions: ['overview'],
-          }),
-          /permission denied/,
-        );
-      },
+    const expired = await issueOwnerRecovery();
+    await transaction((tx) =>
+      tx.update('meta', 'access', {
+        recovery_expires_at: new Date(Date.now() - 60000).toISOString(),
+      }),
     );
-    await t.test(
-      'HTTP recovery rejects cross-origin requests and requires the one-use token',
-      async () => {
-        const token = await issueOwnerRecovery();
-        const context = { params: Promise.resolve({ path: ['auth', 'owner-setup'] }) };
-        const payload = { token, username: 'kinshuk@avxstudios', name: 'Kinshuk', password };
-        const bad = await POST(
-          new Request('http://localhost:3000/api/auth/owner-setup', {
-            method: 'POST',
-            headers: { origin: 'https://other.example' },
-            body: JSON.stringify(payload),
-          }),
-          context,
-        );
-        assert.equal(bad.status, 403);
-        const good = await POST(
-          new Request('http://localhost:3000/api/auth/owner-setup', {
-            method: 'POST',
-            headers: { origin: 'http://localhost:3000' },
-            body: JSON.stringify(payload),
-          }),
-          context,
-        );
-        assert.equal(good.status, 200);
-        assert.match(good.headers.get('set-cookie')!, /Max-Age=0/);
-        const publicIssuer = await POST(
-          new Request('http://localhost:3000/api/auth/owner-setup-link', {
-            method: 'POST',
-            headers: { origin: 'http://localhost:3000' },
-            body: '{}',
-          }),
-          { params: Promise.resolve({ path: ['auth', 'owner-setup-link'] }) },
-        );
-        assert.equal(publicIssuer.status, 401);
-      },
+    await assert.rejects(
+      redeemOwnerRecovery({ ...payload, token: expired }, 'local'),
+      /invalid, expired, or already used/,
     );
-  }
+    const old = await issueOwnerRecovery();
+    await issueOwnerRecovery();
+    await assert.rejects(
+      redeemOwnerRecovery({ ...payload, token: old }, 'local'),
+      /invalid, expired, or already used/,
+    );
+    assert.equal((await sessionState(previousSession)).status, 'approved');
+  });
+  await t.test(
+    'concurrent recovery preserves owner ID and data and revokes old sessions',
+    async () => {
+      const token = await issueOwnerRecovery(),
+        oldPassword = password;
+      password = 'new-' + randomUUID();
+      const payload = { token, username: 'kinshuk@avxstudios', name: 'Kinshuk', password };
+      const results = await Promise.allSettled([
+        redeemOwnerRecovery(payload, 'local'),
+        redeemOwnerRecovery(payload, 'local'),
+      ]);
+      assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
+      assert.equal((await sessionState(previousSession)).status, 'revoked');
+      await assert.rejects(login('owner', oldPassword, false, 'Test'), /Unable to sign in/);
+      const session = await login(payload.username, password, false, 'Test');
+      const recovered = await sessionState(session.token);
+      assert.ok(recovered.principal);
+      assert.equal(recovered.principal.id, originalOwner.id);
+      assert.equal((await get('clients', clientId, recovered.principal))!.name, 'Preserved client');
+      assert.equal((await list('owners')).length, 1);
+      assert.equal(
+        await get('meta', 'access', {
+          ...recovered.principal,
+          role: 'viewer',
+          permissions: ['overview'],
+        }),
+        undefined,
+      );
+    },
+  );
+  await t.test(
+    'legacy setup import preserves credentials and refuses overwriting another workspace',
+    async () => {
+      const source = {
+        owners: await list('owners'),
+        viewer_accounts: [],
+        viewer_permissions: [],
+        service_categories: await list('service_categories'),
+        agency_settings: await list('agency_settings'),
+        access_audit_logs: await list('access_audit_logs'),
+        sessions: [],
+        counters: [],
+      };
+      const original = process.env.AVX_WORKSPACE_ID;
+      process.env.AVX_WORKSPACE_ID = 'import-' + randomUUID();
+      try {
+        assert.equal((await importLegacySetup(source)).alreadyImported, false);
+        const imported = await login('kinshuk@avxstudios', password, false, 'Imported');
+        const importedState = await sessionState(imported.token);
+        assert.ok(importedState.principal);
+        assert.equal(importedState.principal.id, originalOwner.id);
+        assert.equal((await importLegacySetup(source)).alreadyImported, true);
+        await assert.rejects(importLegacySetup({ ...source, owners: [] }), /already initialized/);
+        assert.equal((await list('owners')).length, 1);
+      } finally {
+        const importedRoot = await workspace();
+        await importedRoot.firestore.recursiveDelete(importedRoot);
+        process.env.AVX_WORKSPACE_ID = original;
+      }
+    },
+  );
+  await t.test(
+    'HTTP recovery validates origin and one-use token; no public issuer exists',
+    async () => {
+      const payload = {
+        token: await issueOwnerRecovery(),
+        username: 'kinshuk@avxstudios',
+        name: 'Kinshuk',
+        password,
+      };
+      const call = (origin: string, path = 'owner-setup', body: unknown = payload) =>
+        POST(
+          new Request('http://localhost:3000/api/auth/' + path, {
+            method: 'POST',
+            headers: { origin },
+            body: JSON.stringify(body),
+          }),
+          { params: Promise.resolve({ path: ['auth', path] }) },
+        );
+      assert.equal((await call('https://other.example')).status, 403);
+      const good = await call('http://localhost:3000');
+      assert.equal(good.status, 200);
+      assert.match(good.headers.get('set-cookie')!, /Max-Age=0/);
+      assert.equal((await call('http://localhost:3000', 'owner-setup-link', {})).status, 401);
+    },
+  );
 });

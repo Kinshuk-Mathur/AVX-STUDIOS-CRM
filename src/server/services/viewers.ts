@@ -1,6 +1,8 @@
 import { z } from 'zod';
-import { transaction, one } from '../db';
-import { assertOwner, hashPassword, verifyPassword } from '../security';
+import { transaction, list, get, newRow, now, accessAudit } from '../firebase/store';
+import type { Account, Session, AccessMeta } from '../firebase/models';
+import { assertOwner, hashPassword, verifyPassword, hashToken } from '../security-primitives';
+import { effectiveSessionStatus } from '../security';
 import { insist } from '../errors';
 import { viewerSchema } from '../validation';
 import type { Principal } from '@/lib/domain';
@@ -8,32 +10,32 @@ export async function saveViewer(p: Principal, body: unknown, id?: string) {
   assertOwner(p);
   const v = viewerSchema.parse(body);
   insist(id || v.password, 'Set an initial password.');
-  const hash = v.password ? await hashPassword(v.password) : undefined;
+  const password_hash = v.password ? await hashPassword(v.password) : undefined,
+    username = v.username.toLowerCase();
   return transaction(async (tx) => {
-    const row = await one<{ id: string }>(
-      tx,
-      id
-        ? "UPDATE viewer_accounts SET display_name=$1,username=$2,status=$3,expires_at=$4,password_hash=coalesce($5,password_hash),updated_at=now() WHERE id=$6 AND status<>'Deleted' RETURNING id"
-        : 'INSERT INTO viewer_accounts(display_name,username,status,expires_at,password_hash) VALUES($1,$2,$3,$4,$5) RETURNING id',
-      [v.name, v.username.toLowerCase(), v.status, v.expiresAt || null, hash, ...(id ? [id] : [])],
-    );
-    insist(row, 'Viewer not found.', 404);
-    await tx.query('DELETE FROM viewer_permissions WHERE viewer_id=$1', [row.id]);
-    for (const section of [...new Set(v.permissions)])
-      await tx.query('INSERT INTO viewer_permissions(viewer_id,section) VALUES($1,$2)', [
-        row.id,
-        section,
-      ]);
-    if (id)
-      await tx.query(
-        "UPDATE sessions SET status='revoked',revoked_at=now() WHERE viewer_id=$1 AND status IN('pending','approved')",
-        [id],
-      );
-    await tx.query('INSERT INTO access_audit_logs(viewer_id,event) VALUES($1,$2)', [
-      row.id,
-      id ? 'account_updated_sessions_revoked' : 'account_created',
-    ]);
-    return row;
+    const old = id ? await tx.get<Account>('viewer_accounts', id) : undefined;
+    if (id) insist(old && old.status !== 'Deleted', 'Viewer not found.', 404);
+    const key = hashToken('viewer:' + username),
+      index = await tx.get('usernames', key);
+    insist(!index || index.account_id === id, 'This username is already in use.', 409);
+    const data = {
+      display_name: v.name,
+      username,
+      status: v.status,
+      expires_at: v.expiresAt || null,
+      permissions: [...new Set(v.permissions)],
+      session_version: (old?.session_version || 0) + (old ? 1 : 0),
+      password_hash: password_hash || old!.password_hash,
+      updated_at: now(),
+    };
+    const row = id
+      ? await tx.update('viewer_accounts', id, data)
+      : await tx.create('viewer_accounts', newRow(data));
+    if (old && old.username !== username)
+      await tx.remove('usernames', hashToken('viewer:' + old.username));
+    if (!index) await tx.create('usernames', { id: key, account_id: row.id });
+    await accessAudit(tx, id ? 'account_updated_sessions_revoked' : 'account_created', row.id);
+    return { id: row.id };
   }, p);
 }
 export async function decideAccess(
@@ -43,77 +45,103 @@ export async function decideAccess(
 ) {
   assertOwner(p);
   return transaction(async (tx) => {
-    const session = await one<{ viewer_id: string; status: string; valid: boolean }>(
-      tx,
-      "SELECT s.viewer_id,s.status,(s.request_expires_at>now() AND s.expires_at>now() AND v.status='Active' AND (v.expires_at IS NULL OR v.expires_at>now())) AS valid FROM sessions s JOIN viewer_accounts v ON v.id=s.viewer_id WHERE s.id=$1 FOR UPDATE OF s",
-      [sessionId],
-    );
-    insist(session, 'Access request not found.', 404);
-    if (decision === 'approve' || decision === 'reject')
+    const s = await tx.get<Session>('sessions', sessionId);
+    insist(s?.viewer_id, 'Access request not found.', 404);
+    const a = await tx.get<Account>('viewer_accounts', s.viewer_id),
+      meta = await tx.get<AccessMeta>('meta', 'access');
+    if (decision !== 'revoke')
       insist(
-        session.status === 'pending' && session.valid,
+        effectiveSessionStatus(s, a, meta) === 'pending',
         'This request has expired or has already been handled.',
         409,
       );
-    await tx.query(
-      `UPDATE sessions SET status=$2,approved_at=CASE WHEN $2='approved' THEN now() ELSE approved_at END,revoked_at=CASE WHEN $2='revoked' THEN now() ELSE revoked_at END,last_activity_at=now() WHERE id=$1`,
-      [
-        sessionId,
-        decision === 'approve' ? 'approved' : decision === 'reject' ? 'rejected' : 'revoked',
-      ],
-    );
-    await tx.query(
-      'INSERT INTO access_audit_logs(viewer_id,session_id,event,metadata) VALUES($1,$2,$3,$4)',
-      [session.viewer_id, sessionId, decision, JSON.stringify({ ownerId: p.id })],
-    );
+    const status =
+      decision === 'approve' ? 'approved' : decision === 'reject' ? 'rejected' : 'revoked';
+    await tx.update('sessions', sessionId, {
+      status,
+      last_activity_at: now(),
+      ...(status === 'approved' ? { approved_at: now() } : {}),
+      ...(status === 'revoked' ? { revoked_at: now() } : {}),
+    });
+    await accessAudit(tx, decision, s.viewer_id, sessionId);
     return { ok: true };
   }, p);
 }
 export async function viewerAction(p: Principal, id: string, action: 'revoke' | 'delete') {
   assertOwner(p);
   return transaction(async (tx) => {
-    if (action === 'delete')
-      await tx.query("UPDATE viewer_accounts SET status='Deleted',updated_at=now() WHERE id=$1", [
-        id,
-      ]);
-    await tx.query(
-      "UPDATE sessions SET status='revoked',revoked_at=now() WHERE viewer_id=$1 AND status IN('pending','approved')",
-      [id],
-    );
-    await tx.query('INSERT INTO access_audit_logs(viewer_id,event) VALUES($1,$2)', [
-      id,
-      action === 'delete' ? 'account_deleted' : 'all_sessions_revoked',
-    ]);
+    const a = await tx.get<Account>('viewer_accounts', id);
+    insist(a, 'Viewer not found.', 404);
+    await tx.update('viewer_accounts', id, {
+      session_version: a.session_version + 1,
+      updated_at: now(),
+      ...(action === 'delete' ? { status: 'Deleted' } : {}),
+    });
+    await accessAudit(tx, action === 'delete' ? 'account_deleted' : 'all_sessions_revoked', id);
     return { ok: true };
   }, p);
 }
 export async function viewerData(p: Principal) {
   assertOwner(p);
-  return transaction(
-    async (tx) => ({
-      viewers: (
-        await tx.query(
-          `SELECT v.id,v.display_name,v.username,v.status,v.expires_at,v.last_login,v.created_at,coalesce((SELECT array_agg(section) FROM viewer_permissions WHERE viewer_id=v.id),'{}') AS permissions,(SELECT max(created_at) FROM sessions WHERE viewer_id=v.id) AS last_request,(SELECT count(*) FROM sessions WHERE viewer_id=v.id AND status='approved' AND expires_at>now() AND revoked_at IS NULL AND last_activity_at>now()-(idle_minutes||' minutes')::interval) AS active_sessions FROM viewer_accounts v WHERE status<>'Deleted' ORDER BY created_at DESC`,
-        )
-      ).rows,
-      requests: (
-        await tx.query(
-          `SELECT s.id,s.viewer_id,s.device,s.created_at,s.request_expires_at,v.display_name,v.username FROM sessions s JOIN viewer_accounts v ON v.id=s.viewer_id WHERE s.status='pending' AND s.request_expires_at>now() AND v.status='Active' AND (v.expires_at IS NULL OR v.expires_at>now()) ORDER BY s.created_at`,
-        )
-      ).rows,
-      sessions: (
-        await tx.query(
-          `SELECT s.id,s.viewer_id,s.status,s.device,s.created_at,s.approved_at,s.expires_at,s.last_activity_at,v.display_name,CASE WHEN s.status IN('pending','approved') AND (s.expires_at<=now() OR (s.status='pending' AND s.request_expires_at<=now()) OR (s.status='approved' AND s.last_activity_at<=now()-(s.idle_minutes||' minutes')::interval)) THEN 'expired' ELSE s.status END AS effective_status FROM sessions s JOIN viewer_accounts v ON v.id=s.viewer_id ORDER BY s.created_at DESC LIMIT 100`,
-        )
-      ).rows,
-      history: (
-        await tx.query(
-          `SELECT a.id,a.event,a.created_at,v.display_name FROM access_audit_logs a LEFT JOIN viewer_accounts v ON v.id=a.viewer_id ORDER BY a.created_at DESC LIMIT 100`,
-        )
-      ).rows,
-    }),
-    p,
-  );
+  const [accounts, sessions, history, meta] = await Promise.all([
+    list<Account>('viewer_accounts'),
+    list<Session>('sessions'),
+    list('access_audit_logs'),
+    get<AccessMeta>('meta', 'access'),
+  ]);
+  const accountsById = new Map(accounts.map((a) => [a.id, a]));
+  const joined = sessions
+    .filter((s) => s.viewer_id)
+    .map((s) => ({
+      ...s,
+      effective_status: effectiveSessionStatus(s, accountsById.get(s.viewer_id!), meta),
+      display_name: accountsById.get(s.viewer_id!)?.display_name,
+      username: accountsById.get(s.viewer_id!)?.username,
+    }));
+  const safe = (row: (typeof joined)[number]) =>
+    Object.fromEntries(
+      Object.entries(row).filter(
+        ([key]) => !['token_hash', 'account_version', 'auth_epoch'].includes(key),
+      ),
+    );
+  return {
+    viewers: accounts
+      .filter((a) => a.status !== 'Deleted')
+      .map((a) => ({
+        id: a.id,
+        display_name: a.display_name,
+        username: a.username,
+        status: a.status,
+        expires_at: a.expires_at,
+        last_login: a.last_login,
+        created_at: a.created_at,
+        permissions: a.permissions || [],
+        last_request:
+          joined
+            .filter((s) => s.viewer_id === a.id)
+            .map((s) => s.created_at)
+            .sort()
+            .at(-1) || null,
+        active_sessions: joined.filter(
+          (s) => s.viewer_id === a.id && s.effective_status === 'approved',
+        ).length,
+      })),
+    requests: joined
+      .filter((s) => s.effective_status === 'pending')
+      .sort((a, b) => a.created_at.localeCompare(b.created_at))
+      .map(safe),
+    sessions: joined
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .slice(0, 100)
+      .map(safe),
+    history: history
+      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+      .slice(0, 100)
+      .map((a) => ({
+        ...a,
+        display_name: accountsById.get(String(a.viewer_id))?.display_name || null,
+      })),
+  };
 }
 export async function changeOwnerPassword(p: Principal, body: unknown) {
   assertOwner(p);
@@ -121,24 +149,45 @@ export async function changeOwnerPassword(p: Principal, body: unknown) {
     .object({ currentPassword: z.string().max(128), newPassword: z.string().min(12).max(128) })
     .strict()
     .parse(body);
-  const existing = await transaction(
-    (tx) =>
-      one<{ password_hash: string }>(tx, 'SELECT password_hash FROM owners WHERE id=$1', [p.id]),
-    p,
-  );
+  const old = await get<Account>('owners', p.id);
   insist(
-    existing && (await verifyPassword(v.currentPassword, existing.password_hash)),
+    old && (await verifyPassword(v.currentPassword, old.password_hash)),
     'Current password is incorrect.',
-    400,
   );
-  const hash = await hashPassword(v.newPassword);
+  const password_hash = await hashPassword(v.newPassword);
   return transaction(async (tx) => {
-    await tx.query('UPDATE owners SET password_hash=$1 WHERE id=$2', [hash, p.id]);
-    await tx.query(
-      "UPDATE sessions SET status='revoked',revoked_at=now() WHERE owner_id=$1 AND id<>$2",
-      [p.id, p.sessionId],
+    const current = await tx.get<Account>('owners', p.id);
+    insist(
+      current?.password_hash === old.password_hash,
+      'Credentials changed. Sign in and try again.',
+      409,
     );
-    await tx.query("INSERT INTO access_audit_logs(event) VALUES('owner_password_changed')");
+    const session_version = current.session_version + 1;
+    await tx.update('owners', p.id, { password_hash, session_version });
+    if (p.sessionId) await tx.update('sessions', p.sessionId, { account_version: session_version });
+    await accessAudit(tx, 'owner_password_changed');
     return { ok: true };
+  }, p);
+}
+
+export async function pendingRequests(p: Principal) {
+  assertOwner(p);
+  return transaction(async (tx) => {
+    const meta = await tx.get<AccessMeta>('meta', 'access');
+    const sessions = await tx.list<Session>('sessions', [['status', '==', 'pending']]);
+    const requests = [];
+    for (const s of sessions) {
+      if (!s.viewer_id || s.request_expires_at <= now()) continue;
+      const account = await tx.get<Account>('viewer_accounts', s.viewer_id);
+      if (effectiveSessionStatus(s, account, meta) === 'pending')
+        requests.push({
+          id: s.id,
+          device: s.device,
+          created_at: s.created_at,
+          display_name: account!.display_name,
+          username: account!.username,
+        });
+    }
+    return requests.sort((a, b) => a.created_at.localeCompare(b.created_at));
   }, p);
 }

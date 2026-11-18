@@ -1,10 +1,12 @@
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
 import { hashPassword } from '../src/server/security';
-import { transaction, one, closeDb } from '../src/server/db';
+import { transaction, get, newRow, accessAudit } from '../src/server/firebase/store';
+import { closeFirebase } from '../src/server/firebase/client';
+import { initializeWorkspace } from '../src/server/firebase/bootstrap';
 async function main() {
-  if (process.env.DATABASE_ADMIN_URL) process.env.DATABASE_URL = process.env.DATABASE_ADMIN_URL;
-  const existing = await transaction((tx) => one(tx, 'SELECT id FROM owners LIMIT 1'));
+  await initializeWorkspace();
+  const existing = (await get('meta', 'access'))?.owner_id;
   if (existing)
     throw new Error(
       'Your owner account already exists. Sign in at /login. To reset credentials, stop the local app and run npm run owner:setup.',
@@ -35,11 +37,14 @@ async function main() {
   const hash = await hashPassword(password);
   delete process.env.OWNER_PASSWORD;
   await transaction(async (tx) => {
-    await tx.query('INSERT INTO owners(username,display_name,password_hash) VALUES($1,$2,$3)', [
-      username,
-      name,
-      hash,
-    ]);
+    const meta = await tx.get('meta', 'access');
+    if (meta?.owner_id) throw new Error('An owner already exists. Use npm run owner:reset.');
+    const owner = await tx.create(
+      'owners',
+      newRow({ username, display_name: name, password_hash: hash, session_version: 0 }),
+    );
+    await tx.update('meta', 'access', { owner_id: owner.id });
+    await accessAudit(tx, 'owner_initialized');
   });
   console.log(
     'Owner initialized. Start AVX OS and sign in at /login. No further owner accounts can be created.',
@@ -50,4 +55,4 @@ main()
     console.error((e as Error).message);
     process.exitCode = 1;
   })
-  .finally(closeDb);
+  .finally(closeFirebase);

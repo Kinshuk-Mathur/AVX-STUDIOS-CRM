@@ -295,9 +295,9 @@ export function Settings({
                     Receipt PDFs are stored with immutable historical snapshots.
                   </p>
                   <p>
-                    For production, use PostgreSQL with automated encrypted backups and
-                    point-in-time recovery. Test restoration regularly. For local storage, stop the
-                    app before copying the complete <code>.data/avx</code> directory.
+                    Records are stored in Cloud Firestore. Documents and uploads are stored
+                    privately in Netlify Blobs on the deployed site. Back up both stores and test
+                    restoration regularly. CSV exports contain record data, not attached files.
                   </p>
                   <p>
                     See the project README and deployment guide for migration and recovery commands.

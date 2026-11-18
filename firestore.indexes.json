@@ -1,0 +1,30 @@
+{
+  "indexes": [],
+  "fieldOverrides": [
+    {
+      "collectionGroup": "documents",
+      "fieldPath": "snapshot",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "receipts",
+      "fieldPath": "snapshot",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "documents",
+      "fieldPath": "items",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "projects",
+      "fieldPath": "items",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "payments",
+      "fieldPath": "allocations",
+      "indexes": []
+    }
+  ]
+}

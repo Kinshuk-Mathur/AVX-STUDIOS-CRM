@@ -1,66 +1,169 @@
-import { transaction, one } from '../db';
-import { assertOwner, assertSection } from '../security';
+import { get, list, getMany, type Row, type Filter } from '../firebase/store';
+import type {
+  Client,
+  Project,
+  Task,
+  Payment,
+  FinancialDocument,
+  Expense,
+  Category,
+  Rollup,
+  Settings,
+} from '../firebase/models';
+import { assertOwner, assertSection } from '../security-primitives';
 import { financialAccess, can, today, type Principal, type Section } from '@/lib/domain';
 import { insist } from '../errors';
+const text = (row: Row, key: string) => String(row[key] ?? '');
+const descending = (key: string) => (a: Row, b: Row) => text(b, key).localeCompare(text(a, key));
+const amountSum = (rows: Row[], key: string) =>
+  rows.reduce((sum, r) => sum + BigInt(String(r[key] || 0)), 0n);
 export function canDocuments(p: Principal) {
   return (
     p.role === 'owner' ||
-    (can(p, 'invoices') && can(p, 'payments') && can(p, 'clients') && can(p, 'projects'))
+    ['invoices', 'payments', 'clients', 'projects'].every((s) => can(p, s as Section))
   );
 }
-const revenueCte = `WITH cash AS (SELECT id,client_id,project_id,payment_date AS date,amount_paise AS amount,method FROM payments UNION ALL SELECT r.id,p.client_id,p.project_id,r.refund_date,-r.amount_paise,p.method FROM refunds r JOIN payments p ON p.id=r.payment_id)`;
-const docSelect = `SELECT d.id,d.kind,d.number,d.client_id,d.project_id,d.status AS stored_status,d.issue_date,d.due_date,d.total_paise,d.notes,d.terms,d.created_at,c.name AS client_name,p.name AS project_name,coalesce(pay.received,0)::text AS received,(d.total_paise-coalesce(pay.received,0))::text AS balance,CASE WHEN d.kind='quotation' OR d.status IN('Draft','Voided') THEN d.status WHEN coalesce(pay.received,0)>=d.total_paise THEN 'Paid' WHEN d.due_date<(now() AT TIME ZONE 'Asia/Kolkata')::date THEN 'Overdue' WHEN coalesce(pay.received,0)>0 THEN 'Partially Paid' ELSE 'Issued' END AS status FROM documents d LEFT JOIN clients c ON c.id=d.client_id LEFT JOIN projects p ON p.id=d.project_id LEFT JOIN LATERAL (SELECT sum(pm.amount_paise-coalesce((SELECT sum(r.amount_paise) FROM refunds r WHERE r.payment_id=pm.id),0)) AS received FROM payments pm WHERE pm.invoice_id=d.id) pay ON true`;
-export async function listRecords(p: Principal, section: Section) {
+function omit(row: Row, keys: string[]) {
+  return Object.fromEntries(Object.entries(row).filter(([key]) => !keys.includes(key))) as Row;
+}
+export async function listRecords(
+  p: Principal,
+  section: Section,
+  onlyId?: string,
+  filters: readonly Filter[] = [],
+) {
   assertSection(p, section);
-  return transaction(async (tx) => {
+  if (section === 'invoices')
+    insist(
+      canDocuments(p),
+      'Invoices, Payments, Clients and Projects permissions are required for financial documents.',
+      403,
+    );
+  const table = section === 'invoices' ? 'documents' : section;
+  const data = onlyId
+    ? [await get(table, onlyId, p)].filter((r): r is Row => !!r)
+    : await list(table, filters, p);
+  const financial = financialAccess(p),
+    rows: Row[] = [];
+  const clientCache = new Map<string, Client | undefined>(),
+    projectCache = new Map<string, Project | undefined>();
+  const clientIds = [...new Set(data.map((r) => String(r.client_id || '')).filter(Boolean))];
+  const projectIds = [...new Set(data.map((r) => String(r.project_id || '')).filter(Boolean))];
+  const [relatedClients, relatedProjects] = await Promise.all([
+    getMany<Client>('clients', clientIds, p),
+    getMany<Project>('projects', projectIds, p),
+  ]);
+  for (const id of clientIds) clientCache.set(id, undefined);
+  for (const id of projectIds) projectCache.set(id, undefined);
+  for (const row of relatedClients) clientCache.set(row.id, row);
+  for (const row of relatedProjects) projectCache.set(row.id, row);
+  const client = async (id: string) => {
+    if (!clientCache.has(id)) clientCache.set(id, await get<Client>('clients', id, p));
+    return clientCache.get(id);
+  };
+  const project = async (id: string) => {
+    if (!id) return undefined;
+    if (!projectCache.has(id)) projectCache.set(id, await get<Project>('projects', id, p));
+    return projectCache.get(id);
+  };
+  const projects = section === 'clients' ? await list<Project>('projects', [], p) : [];
+  const tasks = section === 'projects' ? await list<Task>('tasks', [], p) : [];
+  for (const raw of data) {
     if (section === 'clients') {
-      const rows = (
-        await tx.query(
-          `SELECT c.id,c.name,c.company,c.email,c.status,c.profile,c.created_at,c.updated_at,(SELECT count(*) FROM projects p WHERE p.client_id=c.id AND p.status NOT IN('Completed','Cancelled')) AS active_projects ${financialAccess(p) ? `,(SELECT coalesce(sum(pm.amount_paise-coalesce((SELECT sum(r.amount_paise) FROM refunds r WHERE r.payment_id=pm.id),0)),0)::text FROM payments pm WHERE pm.client_id=c.id) AS revenue,(SELECT coalesce(sum(d.total_paise-coalesce((SELECT sum(pm.amount_paise-coalesce((SELECT sum(r.amount_paise) FROM refunds r WHERE r.payment_id=pm.id),0)) FROM payments pm WHERE pm.invoice_id=d.id),0)),0)::text FROM documents d WHERE d.client_id=c.id AND d.kind='invoice' AND d.status='Issued') AS outstanding` : ''} FROM clients c ORDER BY c.updated_at DESC LIMIT 1000`,
-        )
-      ).rows;
-      if (p.role === 'viewer')
-        for (const row of rows) {
-          const profile = row.profile as Record<string, unknown>;
-          row.profile = { ...profile, notes: undefined, links: undefined };
-        }
-      return rows;
+      const r = raw as Client;
+      rows.push({
+        ...omit(r, ['received_paise', 'outstanding_paise']),
+        profile:
+          p.role === 'owner'
+            ? r.profile
+            : Object.fromEntries(
+                Object.entries(r.profile).filter(([k]) => !['notes', 'links'].includes(k)),
+              ),
+        active_projects: projects.filter(
+          (x) => x.client_id === r.id && !['Completed', 'Cancelled'].includes(x.status),
+        ).length,
+        ...(financial ? { revenue: r.received_paise, outstanding: r.outstanding_paise } : {}),
+      });
+    } else if (section === 'projects') {
+      const r = raw as Project;
+      rows.push({
+        ...omit(r, [
+          'items',
+          'value_paise',
+          'received_paise',
+          'has_financial_history',
+          ...(p.role === 'viewer' ? ['notes'] : []),
+        ]),
+        client_name: (await client(r.client_id))?.name || null,
+        task_count: tasks.filter((t) => t.project_id === r.id).length,
+        completed_tasks: tasks.filter((t) => t.project_id === r.id && t.status === 'Completed')
+          .length,
+        ...(financial ? { value: r.value_paise, received: r.received_paise } : {}),
+      });
+    } else if (section === 'payments') {
+      const r = raw as Payment;
+      rows.push({
+        ...omit(r, [
+          'request_hash',
+          'idempotency_key',
+          'allocations',
+          'refunded_paise',
+          ...(!canDocuments(p) ? ['receipt_id', 'receipt_number'] : []),
+          ...(p.role === 'viewer' ? ['notes'] : []),
+        ]),
+        client_name: (await client(r.client_id))?.name || null,
+        project_name: (await project(r.project_id))?.name || null,
+        refunded: r.refunded_paise,
+      });
+    } else if (section === 'invoices') {
+      const r = raw as FinancialDocument,
+        received = BigInt(r.received_paise),
+        balance = BigInt(r.total_paise) - received;
+      const status =
+        r.kind === 'quotation' || ['Draft', 'Voided'].includes(r.status)
+          ? r.status
+          : balance <= 0n
+            ? 'Paid'
+            : r.due_date < today()
+              ? 'Overdue'
+              : received > 0n
+                ? 'Partially Paid'
+                : 'Issued';
+      rows.push({
+        ...omit(r, ['items', 'snapshot', 'pdf_key', 'received_paise', 'has_payments']),
+        stored_status: r.status,
+        status,
+        received: received.toString(),
+        balance: balance.toString(),
+        client_name: (await client(r.client_id))?.name || null,
+        project_name: (await project(r.project_id || ''))?.name || null,
+      });
+    } else if (section === 'tasks' || section === 'expenses') {
+      const r = raw as Task | Expense;
+      rows.push({
+        ...omit(r, p.role === 'viewer' ? ['notes'] : []),
+        project_name: (await project(r.project_id || ''))?.name || null,
+      });
     }
-    if (section === 'projects') {
-      return (
-        await tx.query(
-          `SELECT p.id,p.client_id,p.name,p.description,p.status,p.priority,p.start_date,p.deadline,${p.role === 'owner' ? 'p.notes,' : ''}p.completed_at,p.created_at,c.name AS client_name,(SELECT count(*) FROM tasks t WHERE t.project_id=p.id) AS task_count,(SELECT count(*) FROM tasks t WHERE t.project_id=p.id AND t.status='Completed') AS completed_tasks ${financialAccess(p) ? `,(SELECT coalesce(sum(amount_paise),0)::text FROM project_service_items i WHERE i.project_id=p.id) AS value,(SELECT coalesce(sum(pm.amount_paise-coalesce((SELECT sum(r.amount_paise) FROM refunds r WHERE r.payment_id=pm.id),0)),0)::text FROM payments pm WHERE pm.project_id=p.id) AS received` : ''} FROM projects p LEFT JOIN clients c ON c.id=p.client_id ORDER BY p.updated_at DESC LIMIT 1000`,
-        )
-      ).rows;
-    }
-    if (section === 'tasks')
-      return (
-        await tx.query(
-          `SELECT t.id,t.title,t.description,t.project_id,t.priority,t.status,t.due_date,${p.role === 'owner' ? 't.notes,' : ''}t.created_at,p.name AS project_name FROM tasks t LEFT JOIN projects p ON p.id=t.project_id ORDER BY t.due_date ASC NULLS LAST,t.created_at DESC LIMIT 1000`,
-        )
-      ).rows;
-    if (section === 'payments')
-      return (
-        await tx.query(
-          `SELECT pm.id,pm.reference,pm.client_id,pm.project_id,pm.invoice_id,pm.amount_paise,pm.payment_date,pm.method,pm.transaction_ref,pm.description,${p.role === 'owner' ? 'pm.notes,' : ''}pm.created_at,c.name AS client_name,p.name AS project_name,${canDocuments(p) ? 'r.id AS receipt_id,r.number AS receipt_number,' : ''}(SELECT coalesce(sum(amount_paise),0)::text FROM refunds rf WHERE rf.payment_id=pm.id) AS refunded FROM payments pm LEFT JOIN clients c ON c.id=pm.client_id LEFT JOIN projects p ON p.id=pm.project_id ${canDocuments(p) ? 'LEFT JOIN receipts r ON r.payment_id=pm.id' : ''} ORDER BY pm.payment_date DESC,pm.created_at DESC LIMIT 1000`,
-        )
-      ).rows;
-    if (section === 'invoices') {
-      insist(
-        canDocuments(p),
-        'Invoices, Payments, Clients and Projects permissions are required for financial documents.',
-        403,
-      );
-      return (await tx.query(docSelect + ' ORDER BY d.created_at DESC LIMIT 1000')).rows;
-    }
-    if (section === 'expenses')
-      return (
-        await tx.query(
-          `SELECT e.id,e.name,e.amount_paise,e.expense_date,e.category,e.vendor,e.method,e.project_id,e.recurrence,e.voided_at,e.void_reason,${p.role === 'owner' ? 'e.notes,' : ''}e.created_at,p.name AS project_name FROM expenses e LEFT JOIN projects p ON p.id=e.project_id ORDER BY e.expense_date DESC LIMIT 1000`,
-        )
-      ).rows;
-    return [];
-  }, p);
+  }
+  rows.sort(
+    descending(
+      section === 'payments'
+        ? 'payment_date'
+        : section === 'expenses'
+          ? 'expense_date'
+          : section === 'invoices'
+            ? 'created_at'
+            : 'updated_at',
+    ),
+  );
+  if (section === 'tasks')
+    rows.sort(
+      (a, b) =>
+        String(a.due_date || '9999').localeCompare(String(b.due_date || '9999')) ||
+        descending('created_at')(a, b),
+    );
+  return onlyId ? rows : rows.slice(0, 1000);
 }
 export async function dashboard(p: Principal, from: string, to: string) {
   assertSection(p, 'overview');
@@ -68,231 +171,221 @@ export async function dashboard(p: Principal, from: string, to: string) {
 }
 export async function analytics(p: Principal, from: string, to: string, requireAnalytics = true) {
   if (requireAnalytics) assertSection(p, 'analytics');
+  const financial = financialAccess(p);
   insist(
-    !requireAnalytics || financialAccess(p),
+    !requireAnalytics || financial,
     'Detailed analytics requires all financial sections plus Clients and Projects permissions.',
     403,
   );
-  return transaction(async (tx) => {
-    const output: Record<string, unknown> = { financial: financialAccess(p), from, to };
-    if (financialAccess(p)) {
-      output.totals = await one(
-        tx,
-        `${revenueCte} SELECT coalesce(sum(amount),0)::text AS all_time,coalesce(sum(amount) FILTER(WHERE date BETWEEN $1::date AND $2::date),0)::text AS revenue,coalesce(sum(amount) FILTER(WHERE date>=date_trunc('month',now() AT TIME ZONE 'Asia/Kolkata')::date AND date<= (now() AT TIME ZONE 'Asia/Kolkata')::date),0)::text AS month,coalesce(sum(amount) FILTER(WHERE date>= (date_trunc('month',now() AT TIME ZONE 'Asia/Kolkata')-interval '1 month')::date AND date<date_trunc('month',now() AT TIME ZONE 'Asia/Kolkata')::date),0)::text AS previous_month FROM cash`,
-        [from, to],
-      );
-      const totals = output.totals as Record<string, unknown>;
-      Object.assign(
-        totals,
-        await one(
-          tx,
-          'SELECT coalesce(sum(amount_paise),0)::text AS expenses FROM expenses WHERE voided_at IS NULL AND expense_date BETWEEN $1::date AND $2::date',
-          [from, to],
-        ),
-      );
-      Object.assign(
-        totals,
-        await one(
-          tx,
-          `SELECT coalesce(sum(balance::bigint),0)::text AS outstanding FROM (${docSelect}) d WHERE kind='invoice' AND stored_status='Issued'`,
-        ),
-      );
-      totals.profit = (BigInt(String(totals.revenue)) - BigInt(String(totals.expenses))).toString();
-      output.services = (
-        await tx.query(
-          `WITH allocation AS(SELECT a.service_id,a.amount_paise AS amount,p.payment_date AS date FROM payment_allocations a JOIN payments p ON p.id=a.payment_id UNION ALL SELECT a.service_id,-a.amount_paise,r.refund_date FROM refund_allocations a JOIN refunds r ON r.id=a.refund_id) SELECT s.id,s.name,s.color,coalesce(sum(a.amount),0)::text AS amount FROM service_categories s LEFT JOIN allocation a ON a.service_id=s.id AND a.date BETWEEN $1::date AND $2::date GROUP BY s.id,s.name,s.color ORDER BY sum(a.amount) DESC NULLS LAST`,
-          [from, to],
-        )
-      ).rows;
-      output.trend = (
-        await tx.query(
-          `${revenueCte} SELECT date::text, sum(amount)::text AS revenue,(SELECT coalesce(sum(amount_paise),0)::text FROM expenses e WHERE e.expense_date=cash.date AND e.voided_at IS NULL) AS expenses FROM cash WHERE date BETWEEN $1::date AND $2::date GROUP BY date UNION SELECT expense_date::text,'0' AS revenue,sum(amount_paise)::text AS expenses FROM expenses WHERE voided_at IS NULL AND expense_date BETWEEN $1::date AND $2::date AND expense_date NOT IN(SELECT date FROM cash) GROUP BY expense_date ORDER BY date`,
-          [from, to],
-        )
-      ).rows;
-      output.methods = (
-        await tx.query(
-          `${revenueCte} SELECT method,coalesce(sum(amount),0)::text AS amount FROM cash WHERE date BETWEEN $1::date AND $2::date GROUP BY method ORDER BY sum(amount) DESC`,
-          [from, to],
-        )
-      ).rows;
-      output.expenseCategories = (
-        await tx.query(
-          'SELECT category, sum(amount_paise)::text AS amount FROM expenses WHERE voided_at IS NULL AND expense_date BETWEEN $1::date AND $2::date GROUP BY category ORDER BY sum(amount_paise) DESC',
-          [from, to],
-        )
-      ).rows;
-      if (can(p, 'clients')) {
-        output.topClients = (
-          await tx.query(
-            `${revenueCte} SELECT c.id,c.name,c.company,sum(cash.amount)::text AS amount FROM cash JOIN clients c ON c.id=cash.client_id WHERE cash.date BETWEEN $1::date AND $2::date GROUP BY c.id,c.name,c.company ORDER BY sum(cash.amount) DESC LIMIT 5`,
-            [from, to],
-          )
-        ).rows;
-        output.clientMetrics = await one(
-          tx,
-          `${revenueCte} SELECT (SELECT count(*) FROM clients WHERE (created_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $1::date AND $2::date) AS new_clients,(SELECT count(*) FROM (SELECT client_id FROM payments WHERE payment_date BETWEEN $1::date AND $2::date GROUP BY client_id HAVING count(*)>1) repeat) AS repeat_clients,coalesce(round(sum(amount)/nullif(count(DISTINCT client_id),0)),0)::text AS average_revenue FROM cash WHERE date BETWEEN $1::date AND $2::date`,
-          [from, to],
-        );
+  const output: Record<string, unknown> = { financial, from, to };
+  if (financial) {
+    const month = today().slice(0, 7) + '-01',
+      previous = new Date(month + 'T12:00:00Z');
+    previous.setUTCMonth(previous.getUTCMonth() - 1);
+    const previousMonth = previous.toISOString().slice(0, 10);
+    const [all, categories, global] = await Promise.all([
+      list<Rollup>('rollups', [
+        ['date', '>=', from < previousMonth ? from : previousMonth],
+        ['date', '<=', to > today() ? to : today()],
+      ]),
+      list<Category>('service_categories'),
+      get('metrics', 'global'),
+    ]);
+    const within = all.filter((r) => r.date >= from && r.date <= to),
+      cash = within.filter((r) => r.dimension === 'cash'),
+      expenses = within.filter((r) => r.dimension === 'expense');
+    const revenue = amountSum(cash, 'amount_paise'),
+      expense = amountSum(expenses, 'amount_paise');
+    output.totals = {
+      all_time: String(global?.all_time || 0),
+      revenue: revenue.toString(),
+      expenses: expense.toString(),
+      profit: (revenue - expense).toString(),
+      outstanding: String(global?.outstanding || 0),
+      month: amountSum(
+        all.filter((r) => r.dimension === 'cash' && r.date >= month && r.date <= today()),
+        'amount_paise',
+      ).toString(),
+      previous_month: amountSum(
+        all.filter((r) => r.dimension === 'cash' && r.date >= previousMonth && r.date < month),
+        'amount_paise',
+      ).toString(),
+    };
+    const grouped = (dimension: string) => {
+      const groups = new Map<string, { amount: bigint; events: number }>();
+      for (const r of within.filter((r) => r.dimension === dimension)) {
+        const old = groups.get(r.subject) || { amount: 0n, events: 0 };
+        groups.set(r.subject, {
+          amount: old.amount + BigInt(r.amount_paise),
+          events: old.events + r.events,
+        });
       }
-      if (can(p, 'projects'))
-        output.projectRevenue = (
-          await tx.query(
-            `${revenueCte} SELECT p.id,p.name,sum(cash.amount)::text AS amount FROM cash JOIN projects p ON p.id=cash.project_id WHERE cash.date BETWEEN $1::date AND $2::date GROUP BY p.id,p.name ORDER BY sum(cash.amount) DESC LIMIT 20`,
-            [from, to],
-          )
-        ).rows;
-    }
-    if (can(p, 'projects')) {
-      output.projects = (
-        await tx.query(
-          `SELECT p.id,p.name,p.status,p.deadline,p.priority,c.name AS client_name,(SELECT count(*) FROM tasks t WHERE t.project_id=p.id) AS task_count,(SELECT count(*) FROM tasks t WHERE t.project_id=p.id AND status='Completed') AS completed_tasks FROM projects p LEFT JOIN clients c ON c.id=p.client_id WHERE p.status NOT IN('Completed','Cancelled') ORDER BY deadline ASC NULLS LAST LIMIT 6`,
-        )
-      ).rows;
-      output.projectMetrics = await one(
-        tx,
-        `SELECT count(*) FILTER(WHERE status NOT IN('Completed','Cancelled')) AS active,count(*) FILTER(WHERE status='Completed') AS completed,count(*) FILTER(WHERE status NOT IN('Completed','Cancelled') AND deadline<(now() AT TIME ZONE 'Asia/Kolkata')::date) AS overdue,round(avg(extract(epoch FROM completed_at-created_at)/86400) FILTER(WHERE completed_at IS NOT NULL),1) AS average_days FROM projects`,
+      return [...groups].sort((a, b) =>
+        a[1].amount > b[1].amount ? -1 : a[1].amount < b[1].amount ? 1 : 0,
       );
-    }
-    if (can(p, 'tasks'))
-      output.deadlines = (
-        await tx.query(
-          "SELECT id,title,due_date,priority FROM tasks WHERE status<>'Completed' AND due_date IS NOT NULL ORDER BY due_date LIMIT 5",
+    };
+    const services = new Map(grouped('service'));
+    output.services = categories.map((c) => ({
+      id: c.id,
+      name: c.name,
+      color: c.color,
+      amount: (services.get(c.id)?.amount || 0n).toString(),
+    }));
+    output.methods = grouped('method').map(([method, v]) => ({
+      id: method,
+      method,
+      amount: v.amount.toString(),
+    }));
+    output.expenseCategories = grouped('expense').map(([category, v]) => ({
+      id: category,
+      category,
+      amount: v.amount.toString(),
+    }));
+    const days = [...new Set([...cash, ...expenses].map((r) => r.date))].sort();
+    output.trend = days.map((date) => ({
+      id: date,
+      date,
+      revenue: amountSum(
+        cash.filter((r) => r.date === date),
+        'amount_paise',
+      ).toString(),
+      expenses: amountSum(
+        expenses.filter((r) => r.date === date),
+        'amount_paise',
+      ).toString(),
+    }));
+    const clients = grouped('client');
+    output.topClients = await Promise.all(
+      clients.slice(0, 5).map(async ([id, v]) => {
+        const c = await get<Client>('clients', id, p);
+        return { id, name: c?.name || '', company: c?.company || '', amount: v.amount.toString() };
+      }),
+    );
+    output.clientMetrics = {
+      new_clients: (
+        await list(
+          'clients',
+          [
+            ['created_at', '>=', new Date(from + 'T00:00:00.000+05:30').toISOString()],
+            ['created_at', '<=', new Date(to + 'T23:59:59.999+05:30').toISOString()],
+          ],
+          p,
         )
-      ).rows;
-    if (can(p, 'payments'))
-      output.transactions = (
-        await tx.query(
-          'SELECT pm.id,pm.reference,pm.amount_paise,pm.payment_date,c.name AS client_name FROM payments pm LEFT JOIN clients c ON c.id=pm.client_id ORDER BY pm.created_at DESC LIMIT 5',
-        )
-      ).rows;
-    if (p.role === 'owner')
-      output.activity = (
-        await tx.query(
-          'SELECT id,section,description,created_at FROM activity_logs ORDER BY created_at DESC LIMIT 8',
-        )
-      ).rows;
-    return output;
-  }, p);
+      ).length,
+      repeat_clients: clients.filter(([, v]) => v.events > 1).length,
+      average_revenue: clients.length ? (revenue / BigInt(clients.length)).toString() : '0',
+    };
+    output.projectRevenue = await Promise.all(
+      grouped('project')
+        .slice(0, 20)
+        .map(async ([id, v]) => ({
+          id,
+          name: (await get<Project>('projects', id, p))?.name || '',
+          amount: v.amount.toString(),
+        })),
+    );
+  }
+  if (can(p, 'projects')) {
+    const all = await listRecords(p, 'projects'),
+      active = all.filter((r) => !['Completed', 'Cancelled'].includes(String(r.status)));
+    output.projects = active
+      .sort((a, b) => String(a.deadline || '9999').localeCompare(String(b.deadline || '9999')))
+      .slice(0, 6);
+    const completed = all.filter((r) => r.completed_at);
+    output.projectMetrics = {
+      active: active.length,
+      completed: all.filter((r) => r.status === 'Completed').length,
+      overdue: active.filter((r) => r.deadline && String(r.deadline) < today()).length,
+      average_days: completed.length
+        ? (
+            completed.reduce(
+              (s, r) =>
+                s +
+                (Date.parse(String(r.completed_at)) - Date.parse(String(r.created_at))) / 86400000,
+              0,
+            ) / completed.length
+          ).toFixed(1)
+        : null,
+    };
+  }
+  if (can(p, 'tasks'))
+    output.deadlines = (await listRecords(p, 'tasks'))
+      .filter((r) => r.status !== 'Completed' && r.due_date)
+      .slice(0, 5);
+  if (can(p, 'payments'))
+    output.transactions = (await listRecords(p, 'payments'))
+      .sort(descending('created_at'))
+      .slice(0, 5);
+  if (p.role === 'owner')
+    output.activity = (await list('activity_logs', [], p))
+      .sort(descending('created_at'))
+      .slice(0, 8);
+  return output;
 }
 export async function recordDetail(p: Principal, section: Section, id: string) {
-  assertSection(p, section);
-  const rows = await listRecords(p, section);
-  const record = rows.find((r) => r.id === id);
+  const record = (await listRecords(p, section, id))[0];
   insist(record, 'Record not found.', 404);
   const result: Record<string, unknown> = { record };
   if (section === 'clients' || section === 'projects') {
     for (const child of ['projects', 'tasks', 'payments', 'invoices', 'expenses'] as Section[]) {
       if (child === section || !can(p, child) || (child === 'invoices' && !canDocuments(p)))
         continue;
-      const data = await listRecords(p, child);
-      result[child] = data.filter((r) =>
-        section === 'clients' ? r.client_id === id : r.project_id === id,
-      );
+      result[child] = await listRecords(p, child, undefined, [
+        [section === 'clients' ? 'client_id' : 'project_id', '==', id],
+      ]);
     }
-    Object.assign(
-      result,
-      await transaction(
-        async (tx) => ({
-          ...(p.role === 'owner'
-            ? {
-                attachments: (
-                  await tx.query(
-                    'SELECT id,name,mime,size,created_at FROM attachments WHERE section=$1 AND record_id=$2',
-                    [section, id],
-                  )
-                ).rows,
-                activity: (
-                  await tx.query(
-                    'SELECT id,description,created_at FROM activity_logs WHERE entity_id=$1 ORDER BY created_at DESC',
-                    [id],
-                  )
-                ).rows,
-              }
-            : {}),
-          ...(section === 'projects'
-            ? {
-                deliverables: (
-                  await tx.query(
-                    'SELECT id,title,url,version,delivered_at FROM deliverables WHERE project_id=$1 ORDER BY delivered_at DESC',
-                    [id],
-                  )
-                ).rows,
-                ...(financialAccess(p)
-                  ? {
-                      items: (
-                        await tx.query(
-                          'SELECT i.id,i.service_id,i.description,i.amount_paise,s.name AS service_name FROM project_service_items i JOIN service_categories s ON s.id=i.service_id WHERE project_id=$1',
-                          [id],
-                        )
-                      ).rows,
-                    }
-                  : {}),
-              }
-            : {}),
-        }),
-        p,
-      ),
+    if (section === 'projects') {
+      result.deliverables = (await list('deliverables', [['project_id', '==', id]], p)).sort(
+        descending('delivered_at'),
+      );
+      if (financialAccess(p)) {
+        const project = await get<Project>('projects', id, p);
+        const categories = new Map(
+          (await list<Category>('service_categories', [], p)).map((c) => [c.id, c.name]),
+        );
+        result.items = project!.items.map((i) => ({
+          ...i,
+          service_name: categories.get(i.service_id) || '',
+        }));
+      }
+    }
+  }
+  if (p.role === 'owner') {
+    result.attachments = (await list('attachments', [['record_id', '==', id]], p))
+      .filter((r) => r.section === section)
+      .map((r) => omit(r, ['blob_key']));
+    result.activity = (await list('activity_logs', [['entity_id', '==', id]], p)).sort(
+      descending('created_at'),
     );
   }
-  if (p.role === 'owner' && ['payments', 'expenses', 'tasks', 'invoices'].includes(section))
-    Object.assign(
-      result,
-      await transaction(
-        async (tx) => ({
-          attachments: (
-            await tx.query(
-              'SELECT id,name,mime,size,created_at FROM attachments WHERE section=$1 AND record_id=$2',
-              [section, id],
-            )
-          ).rows,
-          activity: (
-            await tx.query(
-              'SELECT id,description,created_at FROM activity_logs WHERE entity_id=$1 ORDER BY created_at DESC',
-              [id],
-            )
-          ).rows,
-        }),
-        p,
-      ),
-    );
   return result;
 }
 export async function search(p: Principal, query: string) {
   const q = query.trim().toLowerCase();
   if (q.length < 2) return [];
-  const result: { id: string; title: string; subtitle: string; section: string }[] = [];
+  const results: { id: string; title: string; subtitle: string; section: string }[] = [];
   for (const section of ['clients', 'projects', 'tasks', 'payments', 'invoices'] as Section[]) {
     if (!can(p, section) || (section === 'invoices' && !canDocuments(p))) continue;
     for (const r of await listRecords(p, section)) {
-      const title = String(r.name || r.title || r.reference || r.number || '');
-      const subtitle = String(r.company || r.client_name || r.project_name || '');
+      const title = String(r.name || r.title || r.reference || r.number || ''),
+        subtitle = String(r.company || r.client_name || r.project_name || '');
       if ((title + ' ' + subtitle + ' ' + String(r.receipt_number || '')).toLowerCase().includes(q))
-        result.push({ id: String(r.id), title, subtitle, section });
+        results.push({ id: r.id, title, subtitle, section });
     }
   }
-  return result.slice(0, 30);
+  return results.slice(0, 30);
 }
 export async function bootstrap(p: Principal) {
-  return transaction(
-    async (tx) => ({
-      principal: p,
-      categories: (
-        await tx.query('SELECT id,name,color,active FROM service_categories ORDER BY name')
-      ).rows,
-      ...(p.role === 'owner'
-        ? {
-            settings: (await one<{ data: Record<string, unknown> }>(
-              tx,
-              'SELECT data FROM agency_settings',
-            ))!.data,
-            emailConfigured: !!(process.env.RESEND_API_KEY && process.env.EMAIL_FROM),
-            storage: process.env.DATABASE_URL ? 'PostgreSQL' : 'Local PostgreSQL (PGlite)',
-          }
-        : {}),
-    }),
-    p,
+  const categories = (await list<Category>('service_categories', [], p)).sort((a, b) =>
+    a.name.localeCompare(b.name),
   );
+  const result: Record<string, unknown> = { principal: p, categories };
+  if (p.role === 'owner') {
+    result.settings = (await get<Settings>('agency_settings', 'agency', p))?.data || {};
+    result.emailConfigured = !!(process.env.RESEND_API_KEY && process.env.EMAIL_FROM);
+    result.storage = 'Cloud Firestore';
+  }
+  return result;
 }
 export function defaultRange() {
   const to = today();
@@ -300,15 +393,15 @@ export function defaultRange() {
 }
 export async function exportRecords(p: Principal, section: Section) {
   assertOwner(p);
-  const rows = await listRecords(p, section);
-  const clean = rows.map((r) =>
-    Object.fromEntries(Object.entries(r).filter(([, v]) => v === null || typeof v !== 'object')),
-  );
-  const keys = [...new Set(clean.flatMap(Object.keys))];
+  const rows = await listRecords(p, section),
+    clean = rows.map((r) =>
+      Object.fromEntries(Object.entries(r).filter(([, v]) => v === null || typeof v !== 'object')),
+    ),
+    keys = [...new Set(clean.flatMap(Object.keys))];
   const escape = (v: unknown) => {
-    let text = String(v ?? '');
-    if (/^[=+\-@\t\r]/.test(text)) text = "'" + text;
-    return '"' + text.replaceAll('"', '""') + '"';
+    let s = String(v ?? '');
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return '"' + s.replaceAll('"', '""') + '"';
   };
   return [
     keys.map(escape).join(','),
